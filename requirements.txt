@@ -1,0 +1,6 @@
+streamlit>=1.26.0
+pandas>=1.5.3
+fpdf>=1.7.2
+openai
+email-validator
+PyMuPDF==1.23.7

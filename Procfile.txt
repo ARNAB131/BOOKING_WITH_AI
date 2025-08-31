@@ -1,0 +1,1 @@
+web: streamlit run slot_booking_app.py --server.enableCORS false
