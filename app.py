@@ -316,7 +316,8 @@ for key, default in [
     ("slot", ""),
     ("symptoms_used", []),
     ("seat_selected", ""),
-    ("beds_avail_day", date.today()),
+    ("beds_avail_day", date.today()),  # widget-managed
+    ("selected_beds_day", None),       # optional copy if you want it
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -601,8 +602,12 @@ if st.session_state.flow_step == "beds":
     st.subheader(f"🛏️ Beds & Cabins – {hospital_name_for_beds}")
     st.caption("Pick a date and tap a square. Legend: ⬜ Available, 🟩 Selected, ▭ Sold")
 
-    # choose date to view availability
-    beds_day = st.date_input("Availability date (usually check-in):", value=st.session_state.get("beds_avail_day", date.today()), key="beds_avail_day")
+    # choose date to view availability (widget manages st.session_state['beds_avail_day'])
+    beds_day = st.date_input(
+        "Availability date (usually check-in):",
+        value=st.session_state.get("beds_avail_day", date.today()),
+        key="beds_avail_day"
+    )
 
     tiers = [
         {"tier": "General Bed",   "price": 100,  "features": ["1 bed","1 chair","bed table"], "ids": [f"G-{i}" for i in range(1,41)], "cols": 10},
@@ -710,7 +715,7 @@ if st.session_state.flow_step == "beds":
             "features": tier_obj["features"],
         }
         st.session_state.seat_selected = selected_unit_input
-        st.session_state.beds_avail_day = beds_day  # keep the chosen day
+        st.session_state.selected_beds_day = beds_day   # store copy if needed (NOTE: don't set the widget key here)
         st.session_state.flow_step = "details"
 
 # ------------------------------------------------------------------------------------
