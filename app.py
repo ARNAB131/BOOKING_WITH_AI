@@ -5,6 +5,7 @@ import io
 import os
 import re
 import math
+import csv
 import fitz  # PyMuPDF for PDF uploads
 from fpdf import FPDF
 from datetime import datetime, timedelta, date
@@ -18,7 +19,7 @@ os.makedirs("data", exist_ok=True)
 st.set_page_config(page_title="Doctigo – AI Doctor & Bed/Cabin Booking", page_icon="🩺", layout="centered")
 
 # ------------------------------------------------------------------------------------
-# Helpers
+# Helpers (general)
 # ------------------------------------------------------------------------------------
 def _normalize_text(s: str) -> str:
     if not isinstance(s, str):
@@ -223,6 +224,81 @@ Features: {features_text}
     return io.BytesIO(pdf_bytes)
 
 # ------------------------------------------------------------------------------------
+# Helpers (bed inventory with per-date availability)
+# ------------------------------------------------------------------------------------
+INVENTORY_PATH = "beds_inventory.csv"
+
+def _tier_ids():
+    return {
+        "General Bed":   [f"G-{i}" for i in range(1, 41)],
+        "General Cabin": [f"C-{i}" for i in range(1, 21)],
+        "VIP Cabin":     [f"V-{i}" for i in range(1, 11)],
+    }
+
+def ensure_inventory():
+    if not os.path.exists(INVENTORY_PATH):
+        with open(INVENTORY_PATH, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(["Hospital", "Tier", "UnitID", "Date", "Status"])  # Status: available|booked
+
+def _ensure_rows_for(hospital: str, tier: str, day: date):
+    """Make sure rows exist for this hospital/tier/day with Status=available."""
+    ensure_inventory()
+    df = pd.read_csv(INVENTORY_PATH)
+    ids = _tier_ids()[tier]
+    day_str = day.strftime("%Y-%m-%d")
+
+    mask = (df["Hospital"].astype(str) == hospital) & (df["Tier"] == tier) & (df["Date"] == day_str)
+    existing = set(df.loc[mask, "UnitID"].astype(str).tolist())
+    missing = [uid for uid in ids if uid not in existing]
+
+    if missing:
+        add = pd.DataFrame({
+            "Hospital": [hospital]*len(missing),
+            "Tier": [tier]*len(missing),
+            "UnitID": missing,
+            "Date": [day_str]*len(missing),
+            "Status": ["available"]*len(missing),
+        })
+        out = pd.concat([df, add], ignore_index=True)
+        out.to_csv(INVENTORY_PATH, index=False)
+
+def get_inventory(hospital: str, tier: str, day: date) -> pd.DataFrame:
+    ensure_inventory()
+    _ensure_rows_for(hospital, tier, day)
+    df = pd.read_csv(INVENTORY_PATH)
+    return df[(df["Hospital"].astype(str) == hospital) & (df["Tier"] == tier) & (df["Date"] == day.strftime("%Y-%m-%d"))].copy()
+
+def mark_booked(hospital: str, tier: str, unit_id: str, day: date):
+    ensure_inventory()
+    _ensure_rows_for(hospital, tier, day)
+    df = pd.read_csv(INVENTORY_PATH)
+    mask = (
+        (df["Hospital"].astype(str) == hospital)
+        & (df["Tier"] == tier)
+        & (df["UnitID"] == unit_id)
+        & (df["Date"] == day.strftime("%Y-%m-%d"))
+    )
+    if mask.any():
+        df.loc[mask, "Status"] = "booked"
+        df.to_csv(INVENTORY_PATH, index=False)
+
+def mark_booked_range(hospital: str, tier: str, unit_id: str, start_day: date, end_day: date | None):
+    """Book unit for each day in [start_day, end_day]. If end_day is None, only start_day."""
+    last = end_day or start_day
+    cur = start_day
+    while cur <= last:
+        mark_booked(hospital, tier, unit_id, cur)
+        cur += timedelta(days=1)
+
+def reset_inventory_for_date(hospital: str, tier: str, day: date):
+    ensure_inventory()
+    _ensure_rows_for(hospital, tier, day)
+    df = pd.read_csv(INVENTORY_PATH)
+    mask = (df["Hospital"].astype(str) == hospital) & (df["Tier"] == tier) & (df["Date"] == day.strftime("%Y-%m-%d"))
+    df.loc[mask, "Status"] = "available"
+    df.to_csv(INVENTORY_PATH, index=False)
+
+# ------------------------------------------------------------------------------------
 # Session state
 # ------------------------------------------------------------------------------------
 if "flow_step" not in st.session_state:
@@ -239,6 +315,8 @@ for key, default in [
     ("booked_doctor", ""),
     ("slot", ""),
     ("symptoms_used", []),
+    ("seat_selected", ""),
+    ("beds_avail_day", date.today()),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -516,37 +594,123 @@ if st.session_state.flow_step in ("hospital", "doctors"):
         st.session_state.flow_step = "beds"
 
 # ------------------------------------------------------------------------------------
-# BEDS/CABINS (Idea 3)
+# BEDS/CABINS (Idea 3) — BookMyShow-style grid with per-date availability
 # ------------------------------------------------------------------------------------
 if st.session_state.flow_step == "beds":
-    st.subheader(f"🛏️ Beds & Cabins – {st.session_state.selected_hospital or 'Hospital'}")
-    st.caption("Choose your option. Click the info to view inclusions.")
+    hospital_name_for_beds = st.session_state.selected_hospital or "Doctigo Partner Hospital"
+    st.subheader(f"🛏️ Beds & Cabins – {hospital_name_for_beds}")
+    st.caption("Pick a date and tap a square. Legend: ⬜ Available, 🟩 Selected, ▭ Sold")
+
+    # choose date to view availability
+    beds_day = st.date_input("Availability date (usually check-in):", value=st.session_state.get("beds_avail_day", date.today()), key="beds_avail_day")
 
     tiers = [
-        {"tier": "General Bed", "price": 100, "features": ["1 bed", "1 chair", "bed table"], "ids": [f"G-{i}" for i in range(1, 41)]},
-        {"tier": "General Cabin", "price": 1000, "features": ["2 beds", "attached washroom", "bed table", "chair", "food x3 times"], "ids": [f"C-{i}" for i in range(1, 21)]},
-        {"tier": "VIP Cabin", "price": 4000, "features": ["premium bed x2", "sofa", "Air Conditioning", "attached washroom", "TV", "fridge", "bed table x2", "coffee table", "2 chairs"], "ids": [f"V-{i}" for i in range(1, 11)]},
+        {"tier": "General Bed",   "price": 100,  "features": ["1 bed","1 chair","bed table"], "ids": [f"G-{i}" for i in range(1,41)], "cols": 10},
+        {"tier": "General Cabin", "price": 1000, "features": ["2 beds","attached washroom","bed table","chair","food x3 times"], "ids": [f"C-{i}" for i in range(1,21)], "cols": 5},
+        {"tier": "VIP Cabin",     "price": 4000, "features": ["premium bed x2","sofa","Air Conditioning","attached washroom","TV","fridge","bed table x2","coffee table","2 chairs"], "ids": [f"V-{i}" for i in range(1,11)], "cols": 5},
     ]
-
-    # Select tier
     tier_names = [t["tier"] for t in tiers]
-    pick_tier = st.radio("Select type", options=tier_names)  # no horizontal=True for 1.26 compat
+    pick_tier = st.radio("Select type", options=tier_names)
     tier_obj = next(t for t in tiers if t["tier"] == pick_tier)
+
+    inv = get_inventory(hospital_name_for_beds, tier_obj["tier"], beds_day)
+    sold = set(inv[inv["Status"] == "booked"]["UnitID"].tolist())
 
     with st.expander(f"ℹ️ What is included in {pick_tier}?"):
         st.markdown(f"**₹{tier_obj['price']} per night**")
         st.markdown("- " + "\n- ".join(tier_obj["features"]))
 
-    st.markdown("#### Choose a specific unit (optional)")
-    unit_id = st.selectbox("Pick a bed/cabin ID (or leave as 'Any available')", options=["Any available"] + tier_obj["ids"])
+    # Hidden text input to receive selection from HTML
+    hidden_label = f"__selected_unit__[{hospital_name_for_beds}]__[{pick_tier}]__[{beds_day}]"
+    selected_unit_input = st.text_input(hidden_label, value=st.session_state.get("seat_selected", ""), key="unit_selected_hidden")
 
-    if st.button("Next ➜"):
+    ids = tier_obj["ids"]
+    cols = tier_obj["cols"]
+    preselected = selected_unit_input
+
+    # Build grid
+    html_cells = ""
+    for uid in ids:
+        status = "sold" if uid in sold else "available"
+        cls = "seat " + ("sold" if status == "sold" else ("selected" if uid == preselected else "available"))
+        html_cells += f'<div class="{cls}" data-id="{uid}" data-status="{status}">{uid}</div>'
+
+    rows = math.ceil(len(ids) / cols)
+    grid_css = f"""
+    <style>
+      .seat-grid {{
+        display: grid;
+        grid-template-columns: repeat({cols}, 36px);
+        gap: 8px;
+        margin: 12px 0 4px 0;
+      }}
+      .seat {{
+        width: 36px; height: 32px; line-height: 32px;
+        border: 2px solid #2a9d8f; border-radius: 6px;
+        text-align: center; font-size: 11px; user-select: none; cursor: pointer;
+        background: #fff; color: #2a9d8f;
+      }}
+      .seat.selected {{
+        background: #2a9d8f; color: #fff; font-weight: 700;
+      }}
+      .seat.sold {{
+        background: #e5e5e5; border-color: #c9c9c9; color: #8a8a8a; cursor: not-allowed;
+      }}
+      .legend {{ display:flex; gap:16px; align-items:center; margin-top:8px; }}
+      .box {{ width:18px; height:14px; border-radius:4px; display:inline-block; margin-right:6px; border:2px solid #2a9d8f; }}
+      .box.sel {{ background:#2a9d8f; }}
+      .box.sold {{ background:#e5e5e5; border-color:#c9c9c9; }}
+    </style>
+    """
+    html_body = f"""
+    <div class="seat-grid" id="grid">{html_cells}</div>
+    <div class="legend">
+      <span><span class="box"></span>Available</span>
+      <span><span class="box sel"></span>Selected</span>
+      <span><span class="box sold"></span>Sold</span>
+    </div>
+    <script>
+      function findHiddenInput(labelText){{
+        const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+        for (let i=0;i<inputs.length;i++){{
+          const prev = inputs[i].previousSibling;
+          if (prev && prev.textContent && prev.textContent.includes(labelText)) return inputs[i];
+        }}
+        return null;
+      }}
+      const hidden = findHiddenInput({hidden_label!r});
+      function selectOne(el){{
+        if (!hidden) return;
+        if (el.classList.contains('sold')) return;
+        document.querySelectorAll('#grid .seat').forEach(s => {{
+          if (!s.classList.contains('sold')) s.classList.remove('selected');
+        }});
+        el.classList.add('selected');
+        hidden.value = el.dataset.id;
+        hidden.dispatchEvent(new Event('input', {{ bubbles: true }}));
+      }}
+      document.querySelectorAll('#grid .seat').forEach(el => {{
+        el.addEventListener('click', () => selectOne(el));
+      }});
+    </script>
+    """
+    components.html(grid_css + html_body, height=(rows * 44 + 120))
+
+    st.markdown("#### Your selection")
+    if selected_unit_input:
+        st.success(f"Selected: **{selected_unit_input}** for **{beds_day.strftime('%d %b %Y')}**")
+    else:
+        st.info("No unit selected yet.")
+
+    if st.button("Next ➜", disabled=not bool(selected_unit_input)):
         st.session_state.bed_choice = {
             "tier": tier_obj["tier"],
-            "unit_id": None if unit_id == "Any available" else unit_id,
+            "unit_id": selected_unit_input,
             "price": tier_obj["price"],
             "features": tier_obj["features"],
         }
+        st.session_state.seat_selected = selected_unit_input
+        st.session_state.beds_avail_day = beds_day  # keep the chosen day
         st.session_state.flow_step = "details"
 
 # ------------------------------------------------------------------------------------
@@ -631,6 +795,24 @@ if st.session_state.flow_step == "summary":
     )
     st.download_button("⬇️ Download Combined PDF", data=pdf_buf, file_name="doctigo_booking_summary.pdf", mime="application/pdf")
 
+    # Reserve (per date or range)
+    if st.session_state.bed_choice and st.session_state.bed_choice.get("unit_id"):
+        start_day = datetime.strptime(st.session_state.patient_details.get("checkin_date"), "%d %B %Y").date()
+        if st.session_state.patient_details.get("checkout_mode") == "date" and st.session_state.patient_details.get("checkout_date"):
+            end_day = datetime.strptime(st.session_state.patient_details["checkout_date"], "%d %B %Y").date()
+        else:
+            end_day = start_day  # unknown discharge → block the first day only
+
+        if st.button("✅ Confirm & Reserve Bed/Cabin"):
+            mark_booked_range(
+                hospital=st.session_state.selected_hospital or "Doctigo Partner Hospital",
+                tier=st.session_state.bed_choice["tier"],
+                unit_id=st.session_state.bed_choice["unit_id"],
+                start_day=start_day,
+                end_day=end_day
+            )
+            st.success("Bed/Cabin reserved. Inventory updated for the selected date range.")
+
     st.markdown("---")
     colA, colB = st.columns(2)
     with colA:
@@ -640,6 +822,7 @@ if st.session_state.flow_step == "summary":
             st.session_state.bed_choice = None
             st.session_state.patient_details = None
             st.session_state.selected_hospital = None
+            st.session_state.seat_selected = ""
     with colB:
         if st.button("🔁 Book Another Bed/Cabin"):
             st.session_state.flow_step = "beds"
@@ -690,7 +873,7 @@ if st.session_state.get("booked", False):
     st.download_button("⬇️ Download PDF", data=pdf_buffer, file_name="appointment.pdf", mime="application/pdf")
 
 # ------------------------------------------------------------------------------------
-# Admin Dashboard (kept)
+# Admin Dashboard (kept) + Bed Inventory Tools
 # ------------------------------------------------------------------------------------
 ADMIN_PASSWORD = "admin123"  # change as needed
 st.markdown("---")
@@ -767,6 +950,18 @@ if admin_access:
                 st.markdown(f"#### {date_.strftime('%d %B %Y')}")
                 for _, row in group.iterrows():
                     st.write(f"👨‍⚕️ {row['Doctor']} - {row['Appointments']} appointment(s)")
+
+        # ---------- Bed Inventory Tools ----------
+        st.markdown("### 🧰 Bed Inventory Tools")
+        hospitals_df = load_hospitals()
+        h_options = hospitals_df["Hospital"].tolist() if not hospitals_df.empty else []
+        sel_hosp = st.selectbox("Hospital", options=h_options) if h_options else st.text_input("Hospital (type)")
+        sel_tier = st.selectbox("Tier", options=["General Bed", "General Cabin", "VIP Cabin"])
+        sel_day = st.date_input("Date to reset", value=date.today())
+
+        if st.button("♻️ Reset availability for that date"):
+            reset_inventory_for_date(sel_hosp, sel_tier, sel_day)
+            st.success("Availability reset to ALL AVAILABLE for that date/tier.")
     else:
         st.info("No appointments to show yet.")
 else:
