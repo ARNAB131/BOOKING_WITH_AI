@@ -6,9 +6,10 @@ import os
 import re
 import math
 import csv
+import json
 import fitz  # PyMuPDF for PDF uploads
 from fpdf import FPDF
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time as dtime
 from ai_booking import recommend_doctors, symptom_specialization_map, generate_slots
 import streamlit.components.v1 as components
 
@@ -118,6 +119,95 @@ def haversine_km(lat1, lon1, lat2, lon2):
     a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
     return R * c
+
+def eta_minutes_from_distance_km(d_km: float) -> int:
+    """Idea 4 banding: <=5km→15m, <=10km→20m, <=20km→30m, else ~2min/km."""
+    if d_km is None or math.isnan(d_km):
+        return 0
+    if d_km <= 5:
+        return 15
+    if d_km <= 10:
+        return 20
+    if d_km <= 20:
+        return 30
+    return int(round(d_km * 2))
+
+def parse_slot_time_start(slot_text: str) -> dtime | None:
+    """
+    Expect "HH:MM AM/PM - HH:MM AM/PM" or "HH:MM AM/PM–HH:MM AM/PM".
+    We parse only the left time.
+    """
+    if not isinstance(slot_text, str):
+        return None
+    left = slot_text.split("-")[0].strip()
+    left = left.replace("–", "-").strip()
+    try:
+        dt = datetime.strptime(left, "%I:%M %p")
+        return dt.time()
+    except Exception:
+        # try HH AM/PM
+        try:
+            dt = datetime.strptime(left, "%I %p")
+            return dt.time()
+        except Exception:
+            return None
+
+def extract_time_and_date_from_slot_field(slot_field: str) -> tuple[str, str]:
+    """
+    From stored CSV "Slot" like "10:00 AM - 10:15 AM on 01 September 2025" → ("10:00 AM - 10:15 AM", "01 September 2025")
+    If not matched, returns (slot_field, "")
+    """
+    if not isinstance(slot_field, str):
+        return ("", "")
+    if " on " in slot_field:
+        t, d = slot_field.split(" on ", 1)
+        return (t.strip(), d.strip())
+    return (slot_field.strip(), "")
+
+def get_booked_times_for(doctor_name: str, day: date) -> set[str]:
+    """Return a set of time-texts already booked for doctor on the given date."""
+    booked = set()
+    ap_path = "appointments.csv"
+    if not os.path.exists(ap_path):
+        return booked
+    try:
+        df = pd.read_csv(ap_path)
+    except Exception:
+        return booked
+    if "Doctor" not in df.columns or "Slot" not in df.columns:
+        return booked
+    day_str = day.strftime("%d %B %Y")
+    df = df[df["Doctor"].astype(str) == str(doctor_name)]
+    for s in df["Slot"].dropna().astype(str).tolist():
+        t, d = extract_time_and_date_from_slot_field(s)
+        if d == day_str and t:
+            booked.add(t)
+    return booked
+
+def pick_first_available_slot(slots: list[str], doctor_name: str, day: date) -> str | None:
+    """Return the first non-booked slot for that doctor/day."""
+    taken = get_booked_times_for(doctor_name, day)
+    for s in slots:
+        if s not in taken:
+            return s
+    return None
+
+def hospital_coords_for_chamber(chamber_text: str, hospitals_df: pd.DataFrame) -> tuple[float | None, float | None, str]:
+    """
+    Try to map a doctor's 'Chamber' to a hospital in hospitals.csv.
+    Returns (lat, lon, hospital_name) or (None, None, "").
+    """
+    if hospitals_df.empty or not isinstance(chamber_text, str):
+        return (None, None, "")
+    chn = _normalize_text(chamber_text)
+    for _, row in hospitals_df.iterrows():
+        hname = str(row["Hospital"])
+        if _normalize_text(hname) in chn:
+            try:
+                return (float(row["Latitude"]), float(row["Longitude"]), hname)
+            except Exception:
+                return (None, None, hname)
+    return (None, None, "")
 
 # --- Original appointment PDF (kept, now unicode-safe) ---
 def generate_pdf_receipt(patient_name, doctor, chamber, slot, symptoms):
@@ -334,14 +424,15 @@ for key, default in [
     ("slot", ""),
     ("symptoms_used", []),
     ("seat_selected", ""),
-    ("beds_avail_day", date.today()),  # widget-managed
-    ("selected_beds_day", None),       # optional copy if you want it
+    ("beds_avail_day", date.today()),
+    ("selected_beds_day", None),
+    ("emergency_pick", ""),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
 # ------------------------------------------------------------------------------------
-# Bulk Appointment Upload (kept)
+# Bulk Appointment Upload (kept, now slot-unique)
 # ------------------------------------------------------------------------------------
 st.markdown("##  Bulk Appointment Upload")
 uploaded_file = st.file_uploader("Upload patient list (CSV or PDF)", type=["csv", "pdf"])
@@ -370,14 +461,20 @@ if uploaded_file:
         if not df_bulk.empty:
             st.success(f"✅ Loaded {len(df_bulk)} patients. Starting auto booking...")
             try:
+                today_str = datetime.today().strftime('%d %B %Y')
+                today_dt = datetime.today().date()
                 for _, row in df_bulk.iterrows():
                     name = row["Patient Name"]
                     symptoms = [s.strip() for s in row["Symptoms"].split(',') if s.strip()]
                     msg, recs = recommend_doctors(symptoms)
                     if recs:
                         selected = recs[0]
-                        slot = selected['Slots'][0]
-                        full_slot = f"{slot} on {datetime.today().strftime('%d %B %Y')}"
+                        # ensure unique slot per doctor per day
+                        first_avail = pick_first_available_slot(selected.get('Slots', []), selected['Doctor'], today_dt)
+                        if not first_avail:
+                            # fallback: skip this patient if fully booked
+                            continue
+                        full_slot = f"{first_avail} on {today_str}"
                         appt = pd.DataFrame([{
                             "Patient Name": name,
                             "Symptoms": '; '.join(symptoms),
@@ -389,7 +486,7 @@ if uploaded_file:
                             appt.to_csv("appointments.csv", mode="a", header=False, index=False)
                         else:
                             appt.to_csv("appointments.csv", mode="w", header=True, index=False)
-                st.success(f"✅ Successfully booked appointments for {len(df_bulk)} patients.")
+                st.success(f"✅ Successfully booked (where available) for {len(df_bulk)} patients.")
             except Exception as e_inner:
                 st.error(f"Error during auto-booking loop: {e_inner}")
     except Exception as e:
@@ -408,76 +505,203 @@ with col2:
         st.session_state.flow_step = "emergency"
 
 # ------------------------------------------------------------------------------------
-# EMERGENCY → Nearest Hospitals (Idea 1)
+# EMERGENCY → Nearest Hospitals (Idea 1 + Idea 4) — single HTML/JS card grid
 # ------------------------------------------------------------------------------------
 if st.session_state.flow_step == "emergency":
     st.subheader("🚑 Nearest Hospitals")
-    st.caption("Tap **Detect My Location** to rank nearby hospitals by distance.")
+    st.caption("Live distance & ETA. Use live tracking for real-time updates, then tap **Select** on a card.")
 
-    # Inputs for location (populated by JS)
+    # Keep inputs so JS can update them
     lat_val = st.text_input("Latitude", value=st.session_state.user_location["lat"] or "", key="lat_input")
     lon_val = st.text_input("Longitude", value=st.session_state.user_location["lon"] or "", key="lon_input")
 
-    components.html("""
-        <button onclick="getLoc()" style="padding:8px 14px;">📍 Detect My Location</button>
-        <p id="locout" style="margin-top:8px;"></p>
-        <script>
-        function getLoc(){
-          if(navigator.geolocation){
-            navigator.geolocation.getCurrentPosition(function(pos){
-              const lat = pos.coords.latitude.toFixed(6);
-              const lon = pos.coords.longitude.toFixed(6);
-              document.getElementById('locout').innerText = "✓ Location captured: " + lat + ", " + lon;
-              const inputs = window.parent.document.querySelectorAll('input[type="text"]');
-              for (let i=0;i<inputs.length;i++){
-                const lbl = inputs[i].previousSibling && inputs[i].previousSibling.textContent ? inputs[i].previousSibling.textContent : "";
-                if (lbl.includes("Latitude")) {
-                  inputs[i].value = lat; inputs[i].dispatchEvent(new Event('input', { bubbles: true }));
-                }
-                if (lbl.includes("Longitude")) {
-                  inputs[i].value = lon; inputs[i].dispatchEvent(new Event('input', { bubbles: true }));
-                }
-              }
-            }, function(err){
-              document.getElementById('locout').innerText = "❌ " + err.message;
-            });
-          } else {
-            document.getElementById('locout').innerText = "❌ Geolocation not supported in this browser.";
-          }
-        }
-        </script>
-    """, height=120)
+    pick_label = "__EMERGENCY_PICK_HOSPITAL__"
+    picked_hospital = st.text_input(pick_label, value=st.session_state.get("emergency_pick", ""), key="emergency_pick")
 
-    hospitals_df = load_hospitals()
-
-    # Store to session if we have lat/lon
+    # Persist user coords to session (if set)
     try:
         st.session_state.user_location["lat"] = float(lat_val) if lat_val else None
         st.session_state.user_location["lon"] = float(lon_val) if lon_val else None
     except:
         pass
 
-    if not hospitals_df.empty and st.session_state.user_location["lat"] and st.session_state.user_location["lon"]:
-        lat0 = st.session_state.user_location["lat"]
-        lon0 = st.session_state.user_location["lon"]
+    hospitals_df = load_hospitals()
+    if hospitals_df.empty:
+        st.info("Upload or prepare `hospitals.csv` to see nearby hospitals.")
+        st.stop()
 
-        hospitals_df["Distance_km"] = hospitals_df.apply(
-            lambda r: haversine_km(lat0, lon0, float(r["Latitude"]), float(r["Longitude"])), axis=1
-        )
-        hospitals_df = hospitals_df.sort_values("Distance_km").reset_index(drop=True)
+    rows = []
+    for _, r in hospitals_df.iterrows():
+        try:
+            rows.append({
+                "name": str(r["Hospital"]),
+                "addr": str(r["Address"]),
+                "lat": float(r["Latitude"]),
+                "lon": float(r["Longitude"]),
+            })
+        except Exception:
+            continue
+    hospitals_json = json.dumps(rows)
 
-        st.markdown("### 🏥 Nearby options")
-        for i, row in hospitals_df.head(5).iterrows():
-            label = "Most Nearest" if i == 0 else ("Next Nearest" if i == 1 else f"Option {i+1}")
-            st.markdown(f"**{label}: {row['Hospital']}**  \n{row['Address']}  \nDistance: {row['Distance_km']:.2f} km")
-            if st.button(f"Select {row['Hospital']}", key=f"pick_hosp_{i}"):
-                st.session_state.selected_hospital = row['Hospital']
-                st.session_state.flow_step = "hospital"
-    else:
-        st.info("Enter Latitude/Longitude (or use Detect My Location).")
+    user_lat = st.session_state.user_location["lat"] or 0.0
+    user_lon = st.session_state.user_location["lon"] or 0.0
+
+    components.html(f"""
+      <style>
+        .em-topbar {{
+          display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; margin:.25rem 0 .75rem 0;
+        }}
+        .em-topbar button {{
+          padding:.45rem .9rem; border-radius:10px; border:1px solid #2a9d8f; color:#2a9d8f; background:#fff; cursor:pointer;
+        }}
+        .em-topbar button:hover {{ background:#e6fffa; }}
+        .em-topbar .muted {{ font-size:.85rem; color:#475569; margin-left:.25rem; }}
+        .em-search input {{
+          padding:.45rem .65rem; border:1px solid #e2e8f0; border-radius:8px; width:260px;
+        }}
+        .em-grid {{
+          display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+          gap:12px;
+        }}
+        .em-card {{
+          border:1px solid #E2E8F0; border-radius:12px; background:#fff; padding:.85rem 1rem;
+          display:flex; flex-direction:column; gap:.45rem;
+        }}
+        .em-title {{ font-weight:700; color:#0f172a; }}
+        .em-addr {{ font-size:.85rem; color:#475569; }}
+        .chips {{ display:inline-flex; gap:.5rem; flex-wrap:wrap; }}
+        .chip  {{ display:inline-flex; align-items:center; padding:.2rem .55rem; font-size:.80rem;
+                 border-radius:999px; border:1px solid #E2E8F0; background:#F8FAFC; }}
+        .chip strong {{ margin-left:.3rem; }}
+        .row-end {{ display:flex; justify-content:flex-end; }}
+        .btn-outline {{ border:1px solid #2a9d8f; color:#2a9d8f; background:#fff; padding:.35rem .8rem; border-radius:8px; cursor:pointer; }}
+        .btn-outline:hover {{ background:#e6fffa; }}
+      </style>
+
+      <div class="em-topbar">
+        <div class="em-search"><input id="q" type="text" placeholder="Search hospitals..." /></div>
+        <button id="start">▶ Start Live Tracking</button>
+        <button id="stop">⏸ Stop</button>
+        <span class="muted" id="status">Lat: {user_lat:.6f}, Lon: {user_lon:.6f}</span>
+      </div>
+
+      <div id="grid" class="em-grid"></div>
+
+      <script>
+        const hospitals = {hospitals_json};
+        let userLat = {user_lat}, userLon = {user_lon};
+        let watchId = null;
+
+        function haversineKm(lat1, lon1, lat2, lon2) {{
+          const R = 6371.0;
+          const toRad = d => d * Math.PI / 180;
+          const dphi = toRad(lat2 - lat1);
+          const dl   = toRad(lon2 - lon1);
+          const p1   = toRad(lat1), p2 = toRad(lat2);
+          const a = Math.sin(dphi/2)**2 + Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2;
+          const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+          return R * c;
+        }}
+        function etaFromDist(dKm) {{
+          if (dKm <= 5)  return 15;
+          if (dKm <= 10) return 20;
+          if (dKm <= 20) return 30;
+          return Math.round(dKm * 2);
+        }}
+
+        function findHiddenInput(labelText){{
+          const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+          for (let i=0;i<inputs.length;i++) {{
+            const prev = inputs[i].previousSibling;
+            if (prev && prev.textContent && prev.textContent.includes(labelText)) return inputs[i];
+          }}
+          return null;
+        }}
+        const hiddenPick = findHiddenInput({pick_label!r});
+        const latInput   = findHiddenInput("Latitude");
+        const lonInput   = findHiddenInput("Longitude");
+        const statusEl   = document.getElementById("status");
+
+        function render(list) {{
+          const enriched = list.map((h) => {{
+            let d = (userLat || userLat===0) && (userLon || userLon===0) ? haversineKm(userLat, userLon, h.lat, h.lon) : NaN;
+            let eta = isNaN(d) ? null : etaFromDist(d);
+            return {{...h, dKm: d, etaMin: eta}};
+          }}).sort((a,b) => (isNaN(a.dKm)?1:a.dKm) - (isNaN(b.dKm)?1:b.dKm));
+
+          const q = (document.getElementById("q").value || "").toLowerCase().trim();
+          const filtered = q ? enriched.filter(h => (h.name+" "+h.addr).toLowerCase().includes(q)) : enriched;
+
+          const grid = document.getElementById("grid");
+          grid.innerHTML = "";
+          filtered.forEach(h => {{
+            const kmTxt  = isNaN(h.dKm) ? "—" : (h.dKm.toFixed(2) + " km");
+            const etaTxt = (h.etaMin==null) ? "—" : ("~" + h.etaMin + " min");
+            const card = document.createElement("div");
+            card.className = "em-card";
+            card.innerHTML = `
+              <div class="em-title">${{h.name}}</div>
+              <div class="em-addr">${{h.addr}}</div>
+              <div class="chips">
+                <span class="chip">📏 <strong class="km">${{kmTxt}}</strong></span>
+                <span class="chip">⏱️ <strong class="eta">${{etaTxt}}</strong></span>
+              </div>
+              <div class="row-end"><button class="btn-outline">Select</button></div>
+            `;
+            card.querySelector(".btn-outline").addEventListener("click", () => {{
+              if (!hiddenPick) return;
+              hiddenPick.value = h.name;
+              hiddenPick.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            }});
+            grid.appendChild(card);
+          }});
+        }}
+
+        function updateCoords(lat, lon) {{
+          userLat = lat; userLon = lon;
+          render(hospitals);
+          if (statusEl) statusEl.textContent = `Lat: ${{lat.toFixed(6)}}, Lon: ${{lon.toFixed(6)}}`;
+          if (latInput) {{ latInput.value = lat.toFixed(6); latInput.dispatchEvent(new Event('input', {{bubbles:true}})); }}
+          if (lonInput) {{ lonInput.value = lon.toFixed(6); lonInput.dispatchEvent(new Event('input', {{bubbles:true}})); }}
+        }}
+
+        render(hospitals);
+
+        const startBtn = document.getElementById("start");
+        const stopBtn  = document.getElementById("stop");
+
+        startBtn.addEventListener("click", () => {{
+          if (!navigator.geolocation) {{
+            alert("Geolocation not supported in this browser.");
+            return;
+          }}
+          if (watchId !== null) return;
+          watchId = navigator.geolocation.watchPosition((pos) => {{
+            updateCoords(pos.coords.latitude, pos.coords.longitude);
+          }}, (err) => {{
+            console.log("Geo error", err);
+            alert("Unable to get location: " + err.message);
+          }}, {{ enableHighAccuracy:true, maximumAge: 1000, timeout: 10000 }});
+        }});
+
+        stopBtn.addEventListener("click", () => {{
+          if (watchId !== null) {{
+            navigator.geolocation.clearWatch(watchId);
+            watchId = null;
+          }}
+        }});
+
+        document.getElementById("q").addEventListener("input", () => render(hospitals));
+      </script>
+    """, height=650)
+
+    if picked_hospital:
+        st.session_state.selected_hospital = picked_hospital
+        st.session_state.flow_step = "hospital"
+        st.session_state.emergency_pick = ""  # clear helper
 
 # ------------------------------------------------------------------------------------
-# HOSPITAL/DOCTORS PAGE (Idea 2)
+# HOSPITAL/DOCTORS PAGE (Idea 2 + Idea 4 ETA + Idea 5 JS cards)
 # ------------------------------------------------------------------------------------
 if st.session_state.flow_step in ("hospital", "doctors"):
     doctor_df = load_doctors_file()
@@ -487,63 +711,30 @@ if st.session_state.flow_step in ("hospital", "doctors"):
     hospitals_df = load_hospitals()
     chosen_hospital = st.session_state.selected_hospital
 
-    # Hospital header (if chosen)
+    # Header
     if st.session_state.flow_step == "hospital" and chosen_hospital:
         st.subheader(f"🏥 {chosen_hospital}")
     else:
         st.subheader("🧑‍⚕️ Find Doctors")
 
-    # Resolve selected hospital address to improve matching
+    # Resolve hospital address to improve matching
     hospital_address = ""
     if chosen_hospital and not hospitals_df.empty:
         row = hospitals_df[hospitals_df["Hospital"].astype(str).str.casefold() == chosen_hospital.casefold()]
         if not row.empty and "Address" in row.columns:
             hospital_address = str(row.iloc[0]["Address"])
 
-    # Patient name
-    patient_name = st.text_input("Enter your name:", key="patient_name")
+    # Patient name (quick)
+    _ = st.text_input("Enter your name (you'll confirm later in details):", key="patient_name_quick")
 
-    # Voice-to-text (kept)
-    st.markdown("### 🎙️ Voice Input for Patient Name")
-    components.html(
-        """
-        <button onclick="startDictation()" style="padding: 8px 16px; font-size: 16px; background-color: #4CAF50; color: white; border: none; border-radius: 5px;">🎤 Start Voice Input</button>
-        <p id="output" style="margin-top: 10px; font-weight: bold;"></p>
-        <script>
-        function startDictation() {
-            if (!('webkitSpeechRecognition' in window)) {
-                document.getElementById("output").innerText = "❌ Speech recognition not supported in this browser.";
-                return;
-            }
-            const recognition = new webkitSpeechRecognition();
-            recognition.lang = "en-US";
-            recognition.continuous = false;
-            recognition.interimResults = false;
-            recognition.onstart = function() {
-                document.getElementById("output").innerText = "🎙️ Listening...";
-            };
-            recognition.onresult = function(event) {
-                const transcript = event.results[0][0].transcript;
-                document.getElementById("output").innerText = "✅ You said: " + transcript;
-                const streamlitInput = window.parent.document.querySelectorAll('input[type="text"]')[0];
-                streamlitInput.value = transcript;
-                streamlitInput.dispatchEvent(new Event('input', { bubbles: true }));
-            };
-            recognition.onerror = function(event) {
-                document.getElementById("output").innerText = "❌ Error: " + event.error;
-            };
-            recognition.start();
-        }
-        </script>
-        """,
-        height=180,
-    )
+    # Appointment date (single selector for cards)
+    appt_date = st.date_input("Choose appointment date:", min_value=datetime.today(), key="doc_appt_date")
+    appt_date_str = appt_date.strftime("%d %B %Y")
+    today_dt = datetime.today().date()
 
-    # Symptoms input
-    symptom_options = list(symptom_specialization_map.keys())
-    symptoms_selected = st.multiselect("Select your symptom(s):", options=symptom_options)
-    symptoms_typed = st.text_input("Or type your symptoms (comma-separated):", key="typed_symptoms")
-    all_symptoms = list(set(symptoms_selected + [s.strip() for s in symptoms_typed.split(',') if s.strip()]))
+    # Where is the user? (for ETA -> doctor chamber hospital)
+    user_lat = st.session_state.user_location.get("lat")
+    user_lon = st.session_state.user_location.get("lon")
 
     # Filter doctors to chosen hospital (by Hospital column or Chamber text)
     filtered_doctors = doctor_df.copy()
@@ -553,57 +744,218 @@ if st.session_state.flow_step in ("hospital", "doctors"):
             st.info("No exact matches by Hospital/Chamber; showing all doctors.")
             filtered_doctors = doctor_df
 
-    # Direct booking UI (kept, uses filtered doctors)
-    st.markdown("---")
-    st.subheader("📋 Book a Doctor")
-    doctor_names = filtered_doctors['Doctor Name'].unique().tolist()
-    selected_doctor = st.selectbox("Choose a doctor (optional):", ["None"] + doctor_names)
+    # Build doctor cards payload: slots with "booked" marks, ETA, recommended serial
+    cards = []
+    for _, row in filtered_doctors.iterrows():
+        doc_name = str(row["Doctor Name"])
+        spec     = str(row["Specialization"])
+        chamber  = str(row["Chamber"])
+        visit    = str(row["Visiting Time"])
+        slots_all = generate_slots(visit) or []
+        taken = get_booked_times_for(doc_name, appt_date)
+        slot_objs = [{"t": s, "booked": (s in taken)} for s in slots_all]
 
-    direct_slot = ""
-    selected_date = None
-    if selected_doctor != "None":
-        selected_info = filtered_doctors[filtered_doctors['Doctor Name'] == selected_doctor].iloc[0]
-        st.markdown(f"**Specialization:** {selected_info['Specialization']}")
-        st.markdown(f"**Chamber:** {selected_info['Chamber']}")
-        slots = generate_slots(selected_info['Visiting Time'])
-        direct_slot = st.selectbox("Select a slot:", slots, key="direct_slot")
-        today = datetime.today()
-        selected_date = st.date_input("Choose appointment date:", min_value=today)
-        if st.button(f"📅 Book Appointment with Dr. {selected_doctor}", key="direct_book"):
-            st.session_state.appointment = {
-                "doctor": selected_doctor,
-                "chamber": selected_info["Chamber"],
-                "slot": f"{direct_slot} on {selected_date.strftime('%d %B %Y')}",
-                "symptoms": "; ".join(all_symptoms or ["Direct Booking"])
-            }
-            st.success(f"✅ Appointment Booked with Dr. {selected_doctor} at {st.session_state.appointment['slot']}")
+        # Find hospital coords for chamber (or use chosen_hospital coords if selected)
+        if chosen_hospital:
+            hrow = hospitals_df[hospitals_df["Hospital"].astype(str).str.casefold() == chosen_hospital.casefold()]
+            if not hrow.empty:
+                lat, lon, hname = float(hrow.iloc[0]["Latitude"]), float(hrow.iloc[0]["Longitude"]), chosen_hospital
+            else:
+                lat, lon, hname = hospital_coords_for_chamber(chamber, hospitals_df)
+        else:
+            lat, lon, hname = hospital_coords_for_chamber(chamber, hospitals_df)
 
-    # AI recommendations (kept) + hospital-bound filter
-    if st.button("🔍 Find Doctors (AI)") and all_symptoms:
-        message, recommendations = recommend_doctors(all_symptoms)
-        if chosen_hospital and recommendations:
-            recs_df = pd.DataFrame(recommendations)
-            if not recs_df.empty and "Chamber" in recs_df.columns:
-                mask = recs_df["Chamber"].astype(str).str.contains(chosen_hospital, case=False, na=False)
-                recommendations = recs_df[mask].to_dict("records") if mask.any() else recommendations
-        st.session_state.recommendations = recommendations
-        st.session_state.doctor_message = message
+        d_km = None
+        eta_min = None
+        if user_lat is not None and user_lon is not None and lat is not None and lon is not None:
+            try:
+                d_km = haversine_km(float(user_lat), float(user_lon), float(lat), float(lon))
+                eta_min = eta_minutes_from_distance_km(d_km)
+            except Exception:
+                pass
 
-    st.subheader(st.session_state.doctor_message)
-    if st.session_state.recommendations:
-        for idx, doc in enumerate(st.session_state.recommendations):
-            with st.expander(f"{idx+1}. Dr. {doc['Doctor']} - {doc['Specialization']}"):
-                st.markdown(f"**Chamber:** {doc['Chamber']}")
-                slot = st.selectbox(f"Select a slot for Dr. {doc['Doctor']}", options=doc['Slots'], key=f"slot_{idx}")
-                appt_date = st.date_input(f"Choose date for Dr. {doc['Doctor']}", key=f"date_{idx}", min_value=datetime.today())
-                if st.button(f"Book Appointment with Dr. {doc['Doctor']}", key=f"book_{idx}"):
-                    st.session_state.appointment = {
-                        "doctor": doc["Doctor"],
-                        "chamber": doc["Chamber"],
-                        "slot": f"{slot} on {appt_date.strftime('%d %B %Y')}",
-                        "symptoms": "; ".join(all_symptoms)
-                    }
-                    st.success(f"✅ Appointment Booked with Dr. {doc['Doctor']} at {slot} on {appt_date.strftime('%d %B %Y')}")
+        # Recommended serial/slot (earliest non-booked after now+ETA if same-day)
+        rec_idx = None
+        rec_slot = None
+        threshold_dt = None
+        if appt_date == today_dt:
+            now = datetime.now()
+            plus_eta = now + timedelta(minutes=(eta_min or 0))
+            threshold_dt = plus_eta
+        else:
+            threshold_dt = datetime.combine(appt_date, dtime(hour=0, minute=0))
+        for idx, s in enumerate(slots_all):
+            if s in taken:
+                continue
+            stime = parse_slot_time_start(s)
+            if not stime:
+                # if can't parse, take the first available
+                rec_idx = idx + 1
+                rec_slot = s
+                break
+            slot_dt = datetime.combine(appt_date, stime)
+            if slot_dt >= threshold_dt:
+                rec_idx = idx + 1
+                rec_slot = s
+                break
+
+        cards.append({
+            "doc": doc_name,
+            "spec": spec,
+            "chamber": chamber,
+            "slots": slot_objs,
+            "etaMin": eta_min,
+            "dKm": None if d_km is None else round(d_km, 2),
+            "recIndex": rec_idx,
+            "recSlot": rec_slot,
+        })
+
+    # Hidden inputs to receive a pick from JS
+    H_DOC = "__DOC_PICK_NAME__"
+    H_SLOT = "__DOC_PICK_SLOT__"
+    H_DATE = "__DOC_PICK_DATE__"
+    picked_doc  = st.text_input(H_DOC,  value=st.session_state.appointment["doctor"]  if st.session_state.appointment else "", key="pick_doc")
+    picked_slot = st.text_input(H_SLOT, value=st.session_state.appointment["slot"].split(" on ")[0] if st.session_state.appointment else "", key="pick_slot")
+    picked_date = st.text_input(H_DATE, value=appt_date_str, key="pick_date")
+
+    # Render cards with HTML/JS
+    cards_json = json.dumps(cards)
+    components.html(f"""
+      <style>
+        .dc-grid {{
+          display:grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+          gap:14px; margin-top:.25rem;
+        }}
+        .dc-card {{
+          border:1px solid #E2E8F0; border-radius:14px; background:#fff; padding:1rem;
+          display:flex; flex-direction:column; gap:.5rem;
+        }}
+        .dc-h {{
+          display:flex; align-items:flex-start; justify-content:space-between; gap:.75rem;
+        }}
+        .dc-title {{ font-weight:800; color:#0f172a; }}
+        .dc-spec  {{ font-size:.9rem; color:#334155; }}
+        .dc-chamber {{ font-size:.85rem; color:#475569; }}
+        .dc-meta {{ display:flex; gap:.5rem; flex-wrap:wrap; }}
+        .chip {{
+          display:inline-flex; align-items:center; gap:.25rem; padding:.2rem .55rem; font-size:.78rem;
+          border-radius:999px; border:1px solid #E2E8F0; background:#F8FAFC;
+        }}
+        .slots {{ display:flex; flex-wrap:wrap; gap:.4rem; margin-top:.35rem; }}
+        .slot {{
+          padding:.28rem .55rem; border:1px solid #CBD5E1; border-radius:9px; font-size:.82rem; cursor:pointer; user-select:none;
+          background:#fff; color:#0f172a;
+        }}
+        .slot:hover {{ background:#F1F5F9; }}
+        .slot.booked {{
+          opacity:.45; cursor:not-allowed; text-decoration:line-through;
+          background:#F8FAFC;
+        }}
+        .rec {{
+          font-size:.8rem; color:#16a34a; font-weight:700; margin-top:.2rem;
+        }}
+      </style>
+
+      <div class="dc-grid" id="docgrid"></div>
+
+      <script>
+        const cards = {cards_json};
+        const apptDate = {appt_date_str!r};
+
+        function findHiddenInput(labelText){{
+          const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+          for (let i=0;i<inputs.length;i++) {{
+            const prev = inputs[i].previousSibling;
+            if (prev && prev.textContent && prev.textContent.includes(labelText)) return inputs[i];
+          }}
+          return null;
+        }}
+        const hDoc  = findHiddenInput({H_DOC!r});
+        const hSlot = findHiddenInput({H_SLOT!r});
+        const hDate = findHiddenInput({H_DATE!r});
+
+        function render() {{
+          const grid = document.getElementById("docgrid");
+          grid.innerHTML = "";
+          cards.forEach(c => {{
+            const card = document.createElement("div");
+            card.className = "dc-card";
+
+            const kmTxt  = (c.dKm==null) ? "—" : (c.dKm.toFixed(2) + " km");
+            const etaTxt = (c.etaMin==null) ? "—" : ("~" + c.etaMin + " min");
+
+            const recTxt = (c.recIndex && c.recSlot) ? `Recommended: S${{c.recIndex}} — ${{c.recSlot}}` : "";
+
+            card.innerHTML = `
+              <div class="dc-h">
+                <div>
+                  <div class="dc-title">Dr. ${{c.doc}}</div>
+                  <div class="dc-spec">${{c.spec}}</div>
+                </div>
+                <div class="dc-meta">
+                  <span class="chip">📏 <strong>${{kmTxt}}</strong></span>
+                  <span class="chip">⏱️ <strong>${{etaTxt}}</strong></span>
+                </div>
+              </div>
+              <div class="dc-chamber">${{c.chamber}}</div>
+              <div class="slots" id="slots-${{btoa(c.doc)}}">
+                ${{
+                  c.slots.map(s => `
+                    <div class="slot ${'{'}{booked:'booked','': ''}{'}'}".replace('{{booked}}', s.booked ? 'booked' : '') 
+                         data-doc="${{c.doc}}" data-slot="${{s.t}}">${{s.t}}</div>
+                  `).join('')
+                }}
+              </div>
+              <div class="rec">${{recTxt}}</div>
+            `;
+
+            card.querySelectorAll(".slot").forEach(el => {{
+              if (el.classList.contains("booked")) return;
+              el.addEventListener("click", () => {{
+                if (!hDoc || !hSlot || !hDate) return;
+                hDoc.value  = el.dataset.doc;
+                hSlot.value = el.dataset.slot;
+                hDate.value = apptDate;
+                hDoc.dispatchEvent(new Event('input', {{bubbles:true}}));
+                hSlot.dispatchEvent(new Event('input', {{bubbles:true}}));
+                hDate.dispatchEvent(new Event('input', {{bubbles:true}}));
+              }});
+            }});
+
+            grid.appendChild(card);
+          }});
+        }
+        render();
+      </script>
+    """, height=750)
+
+    # If selection made via the grid, set appointment in session (do NOT persist yet)
+    if picked_doc and picked_slot and picked_date:
+        st.session_state.appointment = {
+            "doctor": picked_doc,
+            "chamber": filtered_doctors[filtered_doctors["Doctor Name"] == picked_doc].iloc[0]["Chamber"]
+                       if not filtered_doctors[filtered_doctors["Doctor Name"] == picked_doc].empty else "",
+            "slot": f"{picked_slot} on {picked_date}",
+            "symptoms": "; ".join([]),  # you can fill from AI later if needed
+        }
+        st.success(f"✅ Selected Dr. {picked_doc} — {picked_slot} on {picked_date}")
+
+    # AI recommendations (kept – message only; slots already handled by cards)
+    if st.button("🤖 Get AI Recommendations from symptoms"):
+        # Symptoms input dialog
+        with st.expander("Enter symptoms for AI recommendation"):
+            symptom_options = list(symptom_specialization_map.keys())
+            symptoms_selected = st.multiselect("Select symptom(s):", options=symptom_options, key="ai_sym_sel")
+            symptoms_typed = st.text_input("Or type symptoms (comma-separated):", key="ai_sym_txt")
+        all_symptoms = list(set(st.session_state.get("ai_sym_sel", []) + [s.strip() for s in st.session_state.get("ai_sym_txt","").split(',') if s.strip()]))
+
+        if all_symptoms:
+            message, recommendations = recommend_doctors(all_symptoms)
+            st.session_state.recommendations = recommendations
+            st.session_state.doctor_message = message
+            st.info(message)
+        else:
+            st.warning("Please add at least one symptom to get AI suggestions.")
 
     # Book Beds/Cabins
     st.markdown("---")
@@ -620,7 +972,6 @@ if st.session_state.flow_step == "beds":
     st.subheader(f"🛏️ Beds & Cabins – {hospital_name_for_beds}")
     st.caption("Pick a date and tap a square. Legend: ⬜ Available, 🟩 Selected, ▭ Sold")
 
-    # choose date to view availability (widget manages st.session_state['beds_avail_day'])
     beds_day = st.date_input(
         "Availability date (usually check-in):",
         value=st.session_state.get("beds_avail_day", date.today()),
@@ -640,7 +991,7 @@ if st.session_state.flow_step == "beds":
     sold = set(inv[inv["Status"] == "booked"]["UnitID"].tolist())
 
     with st.expander(f"ℹ️ What is included in {pick_tier}?"):
-        st.markdown(f"**₹{tier_obj['price']} per night**")
+        st.markdown(f"**Rs {tier_obj['price']} per night**")
         st.markdown("- " + "\n- ".join(tier_obj["features"]))
 
     # Hidden text input to receive selection from HTML
@@ -651,7 +1002,6 @@ if st.session_state.flow_step == "beds":
     cols = tier_obj["cols"]
     preselected = selected_unit_input
 
-    # Build grid
     html_cells = ""
     for uid in ids:
         status = "sold" if uid in sold else "available"
@@ -733,16 +1083,16 @@ if st.session_state.flow_step == "beds":
             "features": tier_obj["features"],
         }
         st.session_state.seat_selected = selected_unit_input
-        st.session_state.selected_beds_day = beds_day   # store copy if needed (NOTE: don't set the widget key here)
+        st.session_state.selected_beds_day = beds_day
         st.session_state.flow_step = "details"
 
 # ------------------------------------------------------------------------------------
-# PATIENT DETAILS (Idea 3)
+# PATIENT DETAILS
 # ------------------------------------------------------------------------------------
 if st.session_state.flow_step == "details":
     st.subheader("👤 Patient & Stay Details")
     with st.form("patient_form"):
-        name = st.text_input("Patient's Name", value="")
+        name = st.text_input("Patient's Name", value=st.session_state.get("patient_name_quick",""))
         attendant_name = st.text_input("Attendant's Name", value="")
         attendant_phone = st.text_input("Attendant's Phone Number", value="")
         patient_phone = st.text_input("Patient's Phone Number", value="")
@@ -774,25 +1124,24 @@ if st.session_state.flow_step == "details":
             st.session_state.flow_step = "summary"
 
 # ------------------------------------------------------------------------------------
-# SUMMARY + COMBINED PDF (Idea 3)
+# SUMMARY + COMBINED PDF + CONFIRM (persists appointment & locks timeframe)
 # ------------------------------------------------------------------------------------
 if st.session_state.flow_step == "summary":
     hospital_header = st.session_state.selected_hospital or "Doctigo Partner Hospital"
     st.success("✅ Details captured. Your combined summary is ready.")
 
-    # Simple framed summary
     st.markdown("---")
     st.markdown(f"### 🏥 {hospital_header}")
 
     if st.session_state.appointment:
         ap = st.session_state.appointment
-        st.markdown(f"**Doctor:** Dr. {ap['doctor']}  \n**Chamber:** {ap['chamber']}  \n**Slot:** {ap['slot']}  \n**Symptoms:** {ap['symptoms']}")
+        st.markdown(f"**Doctor:** Dr. {ap['doctor']}  \n**Chamber:** {ap['chamber']}  \n**Slot:** {ap['slot']}  \n**Symptoms:** {ap.get('symptoms','')}")
     else:
         st.info("No doctor appointment selected.")
 
     if st.session_state.bed_choice:
         bc = st.session_state.bed_choice
-        st.markdown(f"**Bed/Cabin:** {bc['tier']} (₹{bc['price']}/night)  \n**Unit ID:** {bc.get('unit_id','Any')}  \n**Features:** {', '.join(bc['features'])}")
+        st.markdown(f"**Bed/Cabin:** {bc['tier']} (Rs {bc['price']}/night)  \n**Unit ID:** {bc.get('unit_id','Any')}  \n**Features:** {', '.join(bc['features'])}")
     else:
         st.info("No bed/cabin selected.")
 
@@ -818,7 +1167,36 @@ if st.session_state.flow_step == "summary":
     )
     st.download_button("⬇️ Download Combined PDF", data=pdf_buf, file_name="doctigo_booking_summary.pdf", mime="application/pdf")
 
-    # Reserve (per date or range)
+    # Confirm & Save Appointment (locks the timeframe)
+    if st.session_state.appointment:
+        ap = st.session_state.appointment
+        # verify slot still free
+        time_text, date_text = extract_time_and_date_from_slot_field(ap["slot"])
+        try:
+            ap_day = datetime.strptime(date_text, "%d %B %Y").date()
+        except Exception:
+            ap_day = datetime.today().date()
+        already = get_booked_times_for(ap["doctor"], ap_day)
+        if time_text in already:
+            st.error("❌ That appointment timeframe was just taken. Please go back and choose another slot.")
+        else:
+            if st.button("✅ Confirm & Save Appointment"):
+                # persist
+                ap_df = pd.DataFrame([{
+                    "Patient Name": (st.session_state.patient_details or {}).get("name", st.session_state.get("patient_name_quick","")),
+                    "Symptoms": ap.get("symptoms",""),
+                    "Doctor": ap["doctor"],
+                    "Chamber": ap["chamber"],
+                    "Slot": ap["slot"],
+                    "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }])
+                if os.path.exists("appointments.csv"):
+                    ap_df.to_csv("appointments.csv", mode="a", header=False, index=False)
+                else:
+                    ap_df.to_csv("appointments.csv", mode="w", header=True, index=False)
+                st.success("✅ Appointment saved and timeframe locked for the day.")
+
+    # Reserve bed/cabin for date or range
     if st.session_state.bed_choice and st.session_state.bed_choice.get("unit_id"):
         start_day = datetime.strptime(st.session_state.patient_details.get("checkin_date"), "%d %B %Y").date()
         if st.session_state.patient_details.get("checkout_mode") == "date" and st.session_state.patient_details.get("checkout_date"):
@@ -826,7 +1204,7 @@ if st.session_state.flow_step == "summary":
         else:
             end_day = start_day  # unknown discharge → block the first day only
 
-        if st.button("✅ Confirm & Reserve Bed/Cabin"):
+        if st.button("🛏️ Confirm & Reserve Bed/Cabin"):
             mark_booked_range(
                 hospital=st.session_state.selected_hospital or "Doctigo Partner Hospital",
                 tier=st.session_state.bed_choice["tier"],
@@ -851,13 +1229,11 @@ if st.session_state.flow_step == "summary":
             st.session_state.flow_step = "beds"
 
 # ------------------------------------------------------------------------------------
-# ORIGINAL quick confirmation (kept) – generates appointment CSV/PDF on old flow
+# ORIGINAL quick confirmation (legacy path)
 # ------------------------------------------------------------------------------------
 if st.session_state.get("booked", False):
     st.success(f"✅ Appointment Booked with Dr. {st.session_state.booked_doctor} at {st.session_state.slot}")
 
-    # Save appointment
-    # NOTE: This block uses the older variables; kept for compatibility only.
     doctor_df_for_save = load_doctors_file()
     chamber_val = ""
     if not doctor_df_for_save.empty:
@@ -866,7 +1242,7 @@ if st.session_state.get("booked", False):
             chamber_val = m.iloc[0]["Chamber"]
 
     appointment_df = pd.DataFrame([{
-        "Patient Name": st.session_state.get("patient_name", ""),
+        "Patient Name": st.session_state.get("patient_name_quick", ""),
         "Symptoms": '; '.join(st.session_state.symptoms_used),
         "Doctor": st.session_state.booked_doctor,
         "Chamber": chamber_val,
@@ -887,7 +1263,7 @@ if st.session_state.get("booked", False):
 
     # PDF Download (old format)
     pdf_buffer = generate_pdf_receipt(
-        st.session_state.get("patient_name", ""),
+        st.session_state.get("patient_name_quick", ""),
         st.session_state.booked_doctor,
         chamber_val,
         st.session_state.slot,
