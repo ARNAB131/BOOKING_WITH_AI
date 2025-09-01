@@ -6,6 +6,7 @@ import os
 import re
 import math
 import csv
+import json
 import fitz  # PyMuPDF for PDF uploads
 from fpdf import FPDF
 from datetime import datetime, timedelta, date
@@ -317,6 +318,83 @@ def reset_inventory_for_date(hospital: str, tier: str, day: date):
     df.to_csv(INVENTORY_PATH, index=False)
 
 # ------------------------------------------------------------------------------------
+# --- IDEA 5: Waitlist helpers (CSV-backed) ------------------------------------------
+# ------------------------------------------------------------------------------------
+WAITLIST_PATH = "waitlist.csv"
+
+def ensure_waitlist():
+    if not os.path.exists(WAITLIST_PATH):
+        with open(WAITLIST_PATH, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                "Timestamp", "Hospital", "Tier", "Date", "Status", "Patient", "Phone", "AssignedUnit"
+            ])  # Status: waiting | assigned
+
+def load_waitlist() -> pd.DataFrame:
+    ensure_waitlist()
+    try:
+        return pd.read_csv(WAITLIST_PATH)
+    except Exception:
+        return pd.DataFrame(columns=["Timestamp","Hospital","Tier","Date","Status","Patient","Phone","AssignedUnit"])
+
+def save_waitlist(df: pd.DataFrame):
+    df.to_csv(WAITLIST_PATH, index=False)
+
+def add_to_waitlist(hospital: str, tier: str, day: date, patient: str = "", phone: str = ""):
+    ensure_waitlist()
+    df = load_waitlist()
+    new_row = {
+        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Hospital": hospital,
+        "Tier": tier,
+        "Date": day.strftime("%Y-%m-%d"),
+        "Status": "waiting",
+        "Patient": patient or "",
+        "Phone": phone or "",
+        "AssignedUnit": ""
+    }
+    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+    save_waitlist(df)
+
+def auto_match_waitlist():
+    """
+    Try to fulfill each waiting request by assigning the first available unit for that date/tier/hospital.
+    Returns a tuple (#assigned, list of (idx, assigned_unit)).
+    """
+    df = load_waitlist()
+    assigned = 0
+    changes = []
+
+    if df.empty:
+        return assigned, changes
+
+    for idx, row in df[df["Status"] == "waiting"].sort_values("Timestamp").iterrows():
+        hosp = str(row["Hospital"])
+        tier = str(row["Tier"])
+        try:
+            day = datetime.strptime(str(row["Date"]), "%Y-%m-%d").date()
+        except Exception:
+            continue
+
+        inv = get_inventory(hosp, tier, day)
+        avail = inv[inv["Status"] != "booked"]["UnitID"].astype(str).tolist()
+        if not avail:
+            continue
+
+        # Assign the lexicographically first unit (e.g., G-1 before G-2)
+        unit_id = sorted(avail, key=lambda x: (len(x), x))[0]
+        mark_booked(hosp, tier, unit_id, day)
+
+        df.at[idx, "Status"] = "assigned"
+        df.at[idx, "AssignedUnit"] = unit_id
+        assigned += 1
+        changes.append((idx, unit_id))
+
+    if assigned > 0:
+        save_waitlist(df)
+
+    return assigned, changes
+
+# ------------------------------------------------------------------------------------
 # Session state
 # ------------------------------------------------------------------------------------
 if "flow_step" not in st.session_state:
@@ -409,6 +487,7 @@ with col2:
 
 # ------------------------------------------------------------------------------------
 # EMERGENCY → Nearest Hospitals (Idea 1)
+# +++ IDEA 4: Quick actions (navigate, share, call) once location is known
 # ------------------------------------------------------------------------------------
 if st.session_state.flow_step == "emergency":
     st.subheader("🚑 Nearest Hospitals")
@@ -473,6 +552,42 @@ if st.session_state.flow_step == "emergency":
             if st.button(f"Select {row['Hospital']}", key=f"pick_hosp_{i}"):
                 st.session_state.selected_hospital = row['Hospital']
                 st.session_state.flow_step = "hospital"
+
+        # --- IDEA 4: Emergency quick actions (maps + share + call)
+        try:
+            nearest = hospitals_df.iloc[0]
+            dest_lat = float(nearest["Latitude"])
+            dest_lon = float(nearest["Longitude"])
+            maps_url = f"https://www.google.com/maps/dir/?api=1&origin={lat0},{lon0}&destination={dest_lat},{dest_lon}"
+            share_my_loc = f"https://maps.google.com/?q={lat0},{lon0}"
+            st.markdown("---")
+            st.markdown("### 🚀 Quick Actions")
+            st.markdown(f"- 🧭 **Navigation:** [Open Google Maps to {nearest['Hospital']}]({maps_url})")
+            st.markdown(f"- 📍 **Share my current location:** {share_my_loc}")
+
+            # Copy share link button (no f-string to avoid brace escaping issues)
+            copy_html = """
+            <button id="copy" style="margin-top:6px;padding:6px 10px;border:1px solid #2a9d8f;border-radius:8px;background:#fff;color:#2a9d8f;cursor:pointer;">Copy share link</button>
+            <script>
+              const link = "__LINK__";
+              const btn = document.getElementById('copy');
+              if (btn && navigator.clipboard) {
+                btn.addEventListener('click', function(){
+                  navigator.clipboard.writeText(link).then(function(){
+                    btn.textContent = "Copied!";
+                    setTimeout(function(){ btn.textContent = "Copy share link"; }, 1200);
+                  });
+                });
+              }
+            </script>
+            """
+            components.html(copy_html.replace("__LINK__", share_my_loc), height=50)
+
+            # Call ambulance tel link (use your local emergency number if needed)
+            st.markdown("- ☎️ **Call Ambulance:** [Tap to call 108](tel:108)")
+        except Exception:
+            pass
+
     else:
         st.info("Enter Latitude/Longitude (or use Detect My Location).")
 
@@ -614,6 +729,7 @@ if st.session_state.flow_step in ("hospital", "doctors"):
 
 # ------------------------------------------------------------------------------------
 # BEDS/CABINS (Idea 3) — BookMyShow-style grid with per-date availability
+# +++ IDEA 5: Waitlist option when nothing is available (and optional proactive join)
 # ------------------------------------------------------------------------------------
 if st.session_state.flow_step == "beds":
     hospital_name_for_beds = st.session_state.selected_hospital or "Doctigo Partner Hospital"
@@ -651,73 +767,76 @@ if st.session_state.flow_step == "beds":
     cols = tier_obj["cols"]
     preselected = selected_unit_input
 
-    # Build grid
+    # Build grid (pure HTML, not an f-string—no brace escaping issues)
     html_cells = ""
     for uid in ids:
         status = "sold" if uid in sold else "available"
         cls = "seat " + ("sold" if status == "sold" else ("selected" if uid == preselected else "available"))
-        html_cells += f'<div class="{cls}" data-id="{uid}" data-status="{status}">{uid}</div>'
+        html_cells += '<div class="{cls}" data-id="{uid}" data-status="{status}">{uid}</div>'.format(cls=cls, uid=uid, status=status)
 
     rows = math.ceil(len(ids) / cols)
-    grid_css = f"""
+    grid_css = """
     <style>
-      .seat-grid {{
+      .seat-grid {
         display: grid;
-        grid-template-columns: repeat({cols}, 36px);
+        grid-template-columns: repeat(REP, 36px);
         gap: 8px;
         margin: 12px 0 4px 0;
-      }}
-      .seat {{
+      }
+      .seat {
         width: 36px; height: 32px; line-height: 32px;
         border: 2px solid #2a9d8f; border-radius: 6px;
         text-align: center; font-size: 11px; user-select: none; cursor: pointer;
         background: #fff; color: #2a9d8f;
-      }}
-      .seat.selected {{
+      }
+      .seat.selected {
         background: #2a9d8f; color: #fff; font-weight: 700;
-      }}
-      .seat.sold {{
+      }
+      .seat.sold {
         background: #e5e5e5; border-color: #c9c9c9; color: #8a8a8a; cursor: not-allowed;
-      }}
-      .legend {{ display:flex; gap:16px; align-items:center; margin-top:8px; }}
-      .box {{ width:18px; height:14px; border-radius:4px; display:inline-block; margin-right:6px; border:2px solid #2a9d8f; }}
-      .box.sel {{ background:#2a9d8f; }}
-      .box.sold {{ background:#e5e5e5; border-color:#c9c9c9; }}
+      }
+      .legend { display:flex; gap:16px; align-items:center; margin-top:8px; }
+      .box { width:18px; height:14px; border-radius:4px; display:inline-block; margin-right:6px; border:2px solid #2a9d8f; }
+      .box.sel { background:#2a9d8f; }
+      .box.sold { background:#e5e5e5; border-color:#c9c9c9; }
     </style>
-    """
-    html_body = f"""
-    <div class="seat-grid" id="grid">{html_cells}</div>
+    """.replace("REP", str(cols))
+    html_body = """
+    <div class="seat-grid" id="grid">__CELLS__</div>
     <div class="legend">
       <span><span class="box"></span>Available</span>
       <span><span class="box sel"></span>Selected</span>
       <span><span class="box sold"></span>Sold</span>
     </div>
     <script>
-      function findHiddenInput(labelText){{
+      function findHiddenInput(labelText){
         const inputs = window.parent.document.querySelectorAll('input[type="text"]');
-        for (let i=0;i<inputs.length;i++){{
+        for (let i=0;i<inputs.length;i++){
           const prev = inputs[i].previousSibling;
           if (prev && prev.textContent && prev.textContent.includes(labelText)) return inputs[i];
-        }}
+        }
         return null;
-      }}
-      const hidden = findHiddenInput({hidden_label!r});
-      function selectOne(el){{
+      }
+      const hidden = findHiddenInput("__LABEL__");
+      function selectOne(el){
         if (!hidden) return;
         if (el.classList.contains('sold')) return;
-        document.querySelectorAll('#grid .seat').forEach(s => {{
+        document.querySelectorAll('#grid .seat').forEach(s => {
           if (!s.classList.contains('sold')) s.classList.remove('selected');
-        }});
+        });
         el.classList.add('selected');
         hidden.value = el.dataset.id;
-        hidden.dispatchEvent(new Event('input', {{ bubbles: true }}));
-      }}
-      document.querySelectorAll('#grid .seat').forEach(el => {{
+        hidden.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      document.querySelectorAll('#grid .seat').forEach(el => {
         el.addEventListener('click', () => selectOne(el));
-      }});
+      });
     </script>
-    """
+    """.replace("__CELLS__", html_cells).replace("__LABEL__", hidden_label)
     components.html(grid_css + html_body, height=(rows * 44 + 120))
+
+    # Availability summary (for waitlist logic)
+    available_units = [uid for uid in ids if uid not in sold]
 
     st.markdown("#### Your selection")
     if selected_unit_input:
@@ -735,6 +854,28 @@ if st.session_state.flow_step == "beds":
         st.session_state.seat_selected = selected_unit_input
         st.session_state.selected_beds_day = beds_day   # store copy if needed (NOTE: don't set the widget key here)
         st.session_state.flow_step = "details"
+
+    # --- IDEA 5: Join Waitlist (when sold out OR proactively)
+    st.markdown("---")
+    st.markdown("### 🛎️ Waitlist (if fully booked)")
+    if len(available_units) == 0:
+        st.warning("All units in this type are currently **sold out** for the selected date.")
+        with st.form("waitlist_form_blocked"):
+            wl_name = st.text_input("Patient Name (optional)", value=st.session_state.get("patient_name",""))
+            wl_phone = st.text_input("Phone (optional)")
+            submitted = st.form_submit_button("🔔 Join Waitlist for this date & type")
+            if submitted:
+                add_to_waitlist(hospital_name_for_beds, pick_tier, beds_day, wl_name, wl_phone)
+                st.success("You're on the waitlist. We'll try to auto-assign a unit when one is freed.")
+    else:
+        with st.expander("Prefer to wait for a different unit? (Optional)"):
+            with st.form("waitlist_form_optional"):
+                wl_name2 = st.text_input("Patient Name (optional)", value=st.session_state.get("patient_name",""))
+                wl_phone2 = st.text_input("Phone (optional)")
+                submitted2 = st.form_submit_button("🔔 Join Waitlist anyway")
+                if submitted2:
+                    add_to_waitlist(hospital_name_for_beds, pick_tier, beds_day, wl_name2, wl_phone2)
+                    st.success("Added to waitlist. If additional units become available, we'll auto-assign in Admin > Waitlist.")
 
 # ------------------------------------------------------------------------------------
 # PATIENT DETAILS (Idea 3)
@@ -786,7 +927,7 @@ if st.session_state.flow_step == "summary":
 
     if st.session_state.appointment:
         ap = st.session_state.appointment
-        st.markdown(f"**Doctor:** Dr. {ap['doctor']}  \n**Chamber:** {ap['chamber']}  \n**Slot:** {ap['slot']}  \n**Symptoms:** {ap['symptoms']}")
+        st.markdown(f"**Doctor:** Dr. {ap['doctor']}  \n**Chamber:** {ap['chamber']}  \n**Slot:** {ap['slot']}  \n**Symptoms:** {ap.get('symptoms','')}")
     else:
         st.info("No doctor appointment selected.")
 
@@ -896,7 +1037,7 @@ if st.session_state.get("booked", False):
     st.download_button("⬇️ Download PDF", data=pdf_buffer, file_name="appointment.pdf", mime="application/pdf")
 
 # ------------------------------------------------------------------------------------
-# Admin Dashboard (kept) + Bed Inventory Tools
+# Admin Dashboard (kept) + Bed Inventory Tools + IDEA 5: Waitlist tools
 # ------------------------------------------------------------------------------------
 ADMIN_PASSWORD = "admin123"  # change as needed
 st.markdown("---")
@@ -985,6 +1126,23 @@ if admin_access:
         if st.button("♻️ Reset availability for that date"):
             reset_inventory_for_date(sel_hosp, sel_tier, sel_day)
             st.success("Availability reset to ALL AVAILABLE for that date/tier.")
+
+        # ---------- IDEA 5: Waitlist Admin ----------
+        st.markdown("### 📬 Waitlist")
+        wl_df = load_waitlist()
+        if wl_df.empty:
+            st.info("No waitlist entries yet.")
+        else:
+            st.dataframe(wl_df, use_container_width=True)
+
+            if st.button("⚙️ Run Auto-Match Now"):
+                assigned_count, changes = auto_match_waitlist()
+                if assigned_count > 0:
+                    st.success(f"Assigned {assigned_count} waitlist request(s): " + ", ".join([f"#{i}→{u}" for i, u in changes]))
+                else:
+                    st.info("No matches found right now (no available units for pending waitlist entries).")
+            wl_df = load_waitlist()  # refresh after potential changes
+            st.download_button("⬇️ Export Waitlist CSV", wl_df.to_csv(index=False).encode("utf-8"), "waitlist.csv", mime="text/csv")
     else:
         st.info("No appointments to show yet.")
 else:
