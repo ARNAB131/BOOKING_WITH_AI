@@ -129,7 +129,7 @@ def eta_minutes_from_distance_km(d_km: float) -> int:
         return 30
     return int(round(d_km * 2))
 
-def extract_time_and_date_from_slot_field(slot_field: str) -> tuple[str, str]:
+def extract_time_and_date_from_slot_field(slot_field: str):
     """From '10:00 AM - 10:15 AM on 01 September 2025' → ('10:00 AM - 10:15 AM','01 September 2025')"""
     if not isinstance(slot_field, str):
         return ("", "")
@@ -138,7 +138,7 @@ def extract_time_and_date_from_slot_field(slot_field: str) -> tuple[str, str]:
         return (t.strip(), d.strip())
     return (slot_field.strip(), "")
 
-def get_booked_times_for(doctor_name: str, day: date) -> set[str]:
+def get_booked_times_for(doctor_name: str, day: date) -> set:
     """Return a set of time-texts already booked for doctor on the given date."""
     booked = set()
     ap_path = "appointments.csv"
@@ -158,7 +158,7 @@ def get_booked_times_for(doctor_name: str, day: date) -> set[str]:
             booked.add(t)
     return booked
 
-def pick_first_available_slot(slots: list[str], doctor_name: str, day: date) -> str | None:
+def pick_first_available_slot(slots: list, doctor_name: str, day: date):
     """Return the first non-booked slot for that doctor/day."""
     taken = get_booked_times_for(doctor_name, day)
     for s in slots:
@@ -166,7 +166,7 @@ def pick_first_available_slot(slots: list[str], doctor_name: str, day: date) -> 
             return s
     return None
 
-def hospital_coords_for_chamber(chamber_text: str, hospitals_df: pd.DataFrame) -> tuple[float | None, float | None, str]:
+def hospital_coords_for_chamber(chamber_text: str, hospitals_df: pd.DataFrame):
     """Try to map a doctor's 'Chamber' to a hospital in hospitals.csv."""
     if hospitals_df.empty or not isinstance(chamber_text, str):
         return (None, None, "")
@@ -384,6 +384,7 @@ for key, default in [
     ("seat_selected", ""),
     ("beds_avail_day", date.today()),
     ("selected_beds_day", None),
+    ("emergency_options", []),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -460,31 +461,28 @@ with col2:
         st.session_state.flow_step = "emergency"
 
 # ------------------------------------------------------------------------------------
-# EMERGENCY → Auto-pick nearest + manual radio selection
+# EMERGENCY → GPS → auto-pick nearest → jump to Hospital page
 # ------------------------------------------------------------------------------------
 if st.session_state.flow_step == "emergency":
     st.subheader("🚑 Nearest Hospitals (Live distance & ETA)")
-    st.caption("Tap **Start Live Tracking** to auto-detect your location. We’ll pick the nearest hospital, and you can switch manually if needed.")
+    st.caption("Click **Start Live Tracking**. We’ll detect your location, auto-select the nearest hospital, then you can change it on the next page if you want.")
 
-    # Read lat/lon from URL query params (set by JS), using new API
-    params = st.query_params
-    # params.get returns a string (new API). But be defensive if a list-like is returned.
-    def _as_str(v):
-        if isinstance(v, list) and v:
-            return v[0]
-        return v
-    qp_lat = _as_str(params.get("lat"))
-    qp_lon = _as_str(params.get("lon"))
+    # Hidden Streamlit inputs as a second trigger path (JS will update them)
+    gps_lat = st.text_input("GPS Latitude", value=st.session_state.user_location["lat"] or "", key="gps_lat")
+    gps_lon = st.text_input("GPS Longitude", value=st.session_state.user_location["lon"] or "", key="gps_lon")
+    # (Optional) keep them out of sight
+    st.markdown(
+        """
+        <style>
+          [aria-label="GPS Latitude"], [aria-label="GPS Longitude"] { display:none !important; }
+          label:has(+ div [aria-label="GPS Latitude"]),
+          label:has(+ div [aria-label="GPS Longitude"]) { display:none !important; }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
 
-    # If URL contains lat/lon, persist to session
-    if qp_lat and qp_lon:
-        try:
-            st.session_state.user_location["lat"] = float(qp_lat)
-            st.session_state.user_location["lon"] = float(qp_lon)
-        except Exception:
-            pass
-
-    # Show small control panel (JS writes lat/lon to URL and reloads the app)
+    # JS control: writes ?lat&lon and also updates the hidden Streamlit inputs
     components.html(
         """
         <div style="display:flex;gap:8px;align-items:center;margin:.25rem 0 .75rem 0;">
@@ -496,22 +494,38 @@ if st.session_state.flow_step == "emergency":
           let watchId = null;
           const statusEl = document.getElementById("status");
 
+          function setHidden(lat, lon){
+            try{
+              const doc = window.top.document;
+              const ilat = doc.querySelector('input[aria-label="GPS Latitude"]');
+              const ilon = doc.querySelector('input[aria-label="GPS Longitude"]');
+              if (ilat){
+                ilat.value = lat.toFixed(6);
+                ilat.dispatchEvent(new Event('input', {bubbles:true}));
+              }
+              if (ilon){
+                ilon.value = lon.toFixed(6);
+                ilon.dispatchEvent(new Event('input', {bubbles:true}));
+              }
+            }catch(e){}
+          }
+
           function reloadWith(lat, lon){
             try {
-              const u = new URL(window.parent.location.href);
+              const u = new URL(window.top.location.href);
               u.searchParams.set('lat', lat.toFixed(6));
               u.searchParams.set('lon', lon.toFixed(6));
-              window.parent.location = u.toString();
+              window.top.location.replace(u.toString());
             } catch(e) {
               // fallback
-              window.parent.location.reload();
+              window.top.location.href = window.top.location.href;
             }
           }
 
-          function onFirstFix(lat, lon){
+          function onFix(lat, lon){
             if (statusEl) statusEl.textContent = "Lat: " + lat.toFixed(6) + ", Lon: " + lon.toFixed(6);
-            // Immediately reload the app with ?lat&lon so Python can react.
-            reloadWith(lat, lon);
+            setHidden(lat, lon);   // trigger a rerun via Streamlit widget path
+            reloadWith(lat, lon);  // and also refresh URL so backend can read query params
           }
 
           document.getElementById("start").addEventListener("click", () => {
@@ -519,19 +533,19 @@ if st.session_state.flow_step == "emergency":
               alert("Geolocation not supported in this browser.");
               return;
             }
-            if (watchId !== null) return;
             navigator.geolocation.getCurrentPosition((pos) => {
-              onFirstFix(pos.coords.latitude, pos.coords.longitude);
+              onFix(pos.coords.latitude, pos.coords.longitude);
             }, (err) => {
               alert("Unable to get location: " + err.message);
             }, { enableHighAccuracy:true, timeout: 10000 });
 
-            // Optional: keep tracking to keep status fresh (not needed for backend)
-            watchId = navigator.geolocation.watchPosition((pos) => {
-              if (statusEl) statusEl.textContent = "Lat: " + pos.coords.latitude.toFixed(6) + ", Lon: " + pos.coords.longitude.toFixed(6);
-            }, (err) => {
-              console.log("Geo error", err);
-            }, { enableHighAccuracy:true, maximumAge: 1000, timeout: 10000 });
+            if (watchId === null){
+              watchId = navigator.geolocation.watchPosition((pos) => {
+                if (statusEl) statusEl.textContent = "Lat: " + pos.coords.latitude.toFixed(6) + ", Lon: " + pos.coords.longitude.toFixed(6);
+              }, (err) => {
+                console.log("Geo error", err);
+              }, { enableHighAccuracy:true, maximumAge: 1000, timeout: 10000 });
+            }
           });
 
           document.getElementById("stop").addEventListener("click", () => {
@@ -546,73 +560,80 @@ if st.session_state.flow_step == "emergency":
         height=80,
     )
 
+    # 1) Read lat/lon from URL query params (new API)
+    params = st.query_params
+    def _as_str(v):
+        if isinstance(v, list) and v:
+            return v[0]
+        return v
+    qp_lat = _as_str(params.get("lat"))
+    qp_lon = _as_str(params.get("lon"))
+
+    # 2) Persist to session (from either URL or hidden fields)
+    lat0 = st.session_state.user_location["lat"]
+    lon0 = st.session_state.user_location["lon"]
+
+    # From URL
+    if qp_lat and qp_lon:
+        try:
+            lat0 = float(qp_lat)
+            lon0 = float(qp_lon)
+            st.session_state.user_location["lat"] = lat0
+            st.session_state.user_location["lon"] = lon0
+        except Exception:
+            pass
+
+    # From hidden widgets (if URL path didn’t work)
+    if not lat0 and gps_lat:
+        try:
+            lat0 = float(gps_lat)
+            st.session_state.user_location["lat"] = lat0
+        except Exception:
+            pass
+    if not lon0 and gps_lon:
+        try:
+            lon0 = float(gps_lon)
+            st.session_state.user_location["lon"] = lon0
+        except Exception:
+            pass
+
     hospitals_df = load_hospitals()
     if hospitals_df.empty:
         st.info("Upload or prepare `hospitals.csv` to see nearby hospitals.")
         st.stop()
 
-    lat0 = st.session_state.user_location["lat"]
-    lon0 = st.session_state.user_location["lon"]
-
-    if lat0 is None or lon0 is None:
-        st.info("Click **Start Live Tracking**. The page will refresh and show nearby hospitals automatically.")
+    # 3) If we have coordinates → compute nearest → store options → jump
+    if (st.session_state.user_location["lat"] is None) or (st.session_state.user_location["lon"] is None):
+        st.info("Click **Start Live Tracking** above. The page will refresh and auto-continue.")
     else:
-        # Compute distance & ETA
-        def _row_calc(r):
+        lat0 = st.session_state.user_location["lat"]
+        lon0 = st.session_state.user_location["lon"]
+
+        def _calc_row(r):
             try:
                 d = haversine_km(lat0, lon0, float(r["Latitude"]), float(r["Longitude"]))
                 return pd.Series({"Distance_km": d, "ETA_min": eta_minutes_from_distance_km(d)})
             except Exception:
                 return pd.Series({"Distance_km": float("nan"), "ETA_min": 0})
 
-        extra = hospitals_df.apply(_row_calc, axis=1)
-        hospitals_df = pd.concat([hospitals_df, extra], axis=1).sort_values("Distance_km")
-        hospitals_df = hospitals_df.reset_index(drop=True)
+        extra = hospitals_df.apply(_calc_row, axis=1)
+        hospitals_df = pd.concat([hospitals_df, extra], axis=1).sort_values("Distance_km").reset_index(drop=True)
 
-        # Auto-pick nearest hospital
+        # Save options for manual override on next page
+        st.session_state.emergency_options = hospitals_df[["Hospital", "Address", "Distance_km", "ETA_min"]].to_dict("records")
+
+        # Auto-pick nearest and jump
         if not hospitals_df.empty:
-            nearest = hospitals_df.iloc[0]
-            auto_name = str(nearest["Hospital"])
-            auto_km = nearest["Distance_km"]
-            auto_eta = nearest["ETA_min"]
-            st.session_state.selected_hospital = auto_name  # auto-select
-            st.success(f"Nearest hospital auto-selected: **{auto_name}** — {auto_km:.2f} km (~{auto_eta} min)")
-
-        # Manual override via radio
-        labels = []
-        values = []
-        for _, r in hospitals_df.iterrows():
-            hname = str(r["Hospital"])
-            km = r["Distance_km"]
-            eta = r["ETA_min"]
-            lab = f"{hname} — {km:.2f} km (~{eta} min)"
-            labels.append(lab)
-            values.append(hname)
-
-        default_index = 0 if values else None
-        choice = st.radio(
-            "Or choose a different hospital:",
-            options=range(len(values)),
-            format_func=lambda i: labels[i],
-            index=default_index if default_index is not None else 0
-        )
-        chosen_name = values[choice] if values else None
-
-        if chosen_name and chosen_name != st.session_state.selected_hospital:
-            st.session_state.selected_hospital = chosen_name
-
-        # Show a compact table, too
-        show_df = hospitals_df[["Hospital", "Address", "Distance_km", "ETA_min"]].rename(
-            columns={"Distance_km": "Distance (km)", "ETA_min": "ETA (min)"}
-        )
-        st.dataframe(show_df, use_container_width=True)
-
-        # Proceed
-        if st.button("Continue ➜"):
+            st.session_state.selected_hospital = str(hospitals_df.iloc[0]["Hospital"])
+            st.success(f"Nearest hospital auto-selected: **{st.session_state.selected_hospital}** — {hospitals_df.iloc[0]['Distance_km']:.2f} km (~{hospitals_df.iloc[0]['ETA_min']} min)")
             st.session_state.flow_step = "hospital"
+            try:
+                st.rerun()
+            except Exception:
+                pass
 
 # ------------------------------------------------------------------------------------
-# HOSPITAL/DOCTORS PAGE (Normal Booking logic unchanged)
+# HOSPITAL/DOCTORS PAGE (Normal Booking + manual override if from Emergency)
 # ------------------------------------------------------------------------------------
 if st.session_state.flow_step in ("hospital", "doctors"):
     doctor_df = load_doctors_file()
@@ -621,6 +642,29 @@ if st.session_state.flow_step in ("hospital", "doctors"):
 
     hospitals_df = load_hospitals()
     chosen_hospital = st.session_state.selected_hospital
+
+    # Manual override list (if we came from emergency and computed distances)
+    if st.session_state.get("emergency_options"):
+        opts = st.session_state.emergency_options
+        labels = []
+        values = []
+        for o in opts:
+            try:
+                labels.append(f"{o['Hospital']} — {float(o['Distance_km']):.2f} km (~{int(o['ETA_min'])} min)")
+            except Exception:
+                labels.append(f"{o['Hospital']}")
+            values.append(o["Hospital"])
+        if values:
+            try:
+                default_idx = values.index(chosen_hospital) if chosen_hospital in values else 0
+            except Exception:
+                default_idx = 0
+            sel = st.selectbox("Change hospital (nearest first):", options=range(len(values)),
+                               format_func=lambda i: labels[i], index=default_idx)
+            new_choice = values[sel]
+            if new_choice != chosen_hospital:
+                st.session_state.selected_hospital = new_choice
+                chosen_hospital = new_choice
 
     if st.session_state.flow_step == "hospital" and chosen_hospital:
         st.subheader(f"🏥 {chosen_hospital}")
@@ -942,9 +986,18 @@ if st.session_state.flow_step == "summary":
             st.session_state.patient_details = None
             st.session_state.selected_hospital = None
             st.session_state.seat_selected = ""
+            st.session_state.emergency_options = []
+            try:
+                st.rerun()
+            except Exception:
+                pass
     with colB:
         if st.button("🔁 Book Another Bed/Cabin"):
             st.session_state.flow_step = "beds"
+            try:
+                st.rerun()
+            except Exception:
+                pass
 
 # ------------------------------------------------------------------------------------
 # ORIGINAL quick confirmation (legacy path)
