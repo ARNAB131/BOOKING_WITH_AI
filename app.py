@@ -122,7 +122,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 def eta_minutes_from_distance_km(d_km: float) -> int:
     """Idea 4 banding: <=5km→15m, <=10km→20m, <=20km→30m, else ~2min/km."""
-    if d_km is None or math.isnan(d_km):
+    if d_km is None or (isinstance(d_km, float) and math.isnan(d_km)):
         return 0
     if d_km <= 5:
         return 15
@@ -505,7 +505,7 @@ with col2:
         st.session_state.flow_step = "emergency"
 
 # ------------------------------------------------------------------------------------
-# EMERGENCY → Nearest Hospitals (Idea 1 + Idea 4) — single HTML/JS card grid
+# EMERGENCY → Nearest Hospitals (Idea 1 + Idea 4)
 # ------------------------------------------------------------------------------------
 if st.session_state.flow_step == "emergency":
     st.subheader("🚑 Nearest Hospitals")
@@ -609,7 +609,7 @@ if st.session_state.flow_step == "emergency":
           return Math.round(dKm * 2);
         }}
 
-        function findHiddenInput(labelText){{
+        function findHiddenInput(labelText) {{
           const inputs = window.parent.document.querySelectorAll('input[type="text"]');
           for (let i=0;i<inputs.length;i++) {{
             const prev = inputs[i].previousSibling;
@@ -818,7 +818,7 @@ if st.session_state.flow_step in ("hospital", "doctors"):
     picked_slot = st.text_input(H_SLOT, value=st.session_state.appointment["slot"].split(" on ")[0] if st.session_state.appointment else "", key="pick_slot")
     picked_date = st.text_input(H_DATE, value=appt_date_str, key="pick_date")
 
-    # Render cards with HTML/JS
+    # Render cards with HTML/JS (all braces escaped for f-string)
     cards_json = json.dumps(cards)
     components.html(f"""
       <style>
@@ -862,7 +862,7 @@ if st.session_state.flow_step in ("hospital", "doctors"):
         const cards = {cards_json};
         const apptDate = {appt_date_str!r};
 
-        function findHiddenInput(labelText){{
+        function findHiddenInput(labelText) {{
           const inputs = window.parent.document.querySelectorAll('input[type="text"]');
           for (let i=0;i<inputs.length;i++) {{
             const prev = inputs[i].previousSibling;
@@ -883,7 +883,6 @@ if st.session_state.flow_step in ("hospital", "doctors"):
 
             const kmTxt  = (c.dKm==null) ? "—" : (c.dKm.toFixed(2) + " km");
             const etaTxt = (c.etaMin==null) ? "—" : ("~" + c.etaMin + " min");
-
             const recTxt = (c.recIndex && c.recSlot) ? `Recommended: S${{c.recIndex}} — ${{c.recSlot}}` : "";
 
             card.innerHTML = `
@@ -899,12 +898,9 @@ if st.session_state.flow_step in ("hospital", "doctors"):
               </div>
               <div class="dc-chamber">${{c.chamber}}</div>
               <div class="slots" id="slots-${{btoa(c.doc)}}">
-                ${{
-                  c.slots.map(s => `
-                    <div class="slot ${'{'}{booked:'booked','': ''}{'}'}".replace('{{booked}}', s.booked ? 'booked' : '') 
-                         data-doc="${{c.doc}}" data-slot="${{s.t}}">${{s.t}}</div>
-                  `).join('')
-                }}
+                ${{ c.slots.map(s => `
+                  <div class="slot ${{s.booked ? 'booked' : ''}}" data-doc="${{c.doc}}" data-slot="${{s.t}}">${{s.t}}</div>
+                `).join('') }}
               </div>
               <div class="rec">${{recTxt}}</div>
             `;
@@ -921,10 +917,9 @@ if st.session_state.flow_step in ("hospital", "doctors"):
                 hDate.dispatchEvent(new Event('input', {{bubbles:true}}));
               }});
             }});
-
             grid.appendChild(card);
           }});
-        }
+        }}
         render();
       </script>
     """, height=750)
@@ -939,23 +934,6 @@ if st.session_state.flow_step in ("hospital", "doctors"):
             "symptoms": "; ".join([]),  # you can fill from AI later if needed
         }
         st.success(f"✅ Selected Dr. {picked_doc} — {picked_slot} on {picked_date}")
-
-    # AI recommendations (kept – message only; slots already handled by cards)
-    if st.button("🤖 Get AI Recommendations from symptoms"):
-        # Symptoms input dialog
-        with st.expander("Enter symptoms for AI recommendation"):
-            symptom_options = list(symptom_specialization_map.keys())
-            symptoms_selected = st.multiselect("Select symptom(s):", options=symptom_options, key="ai_sym_sel")
-            symptoms_typed = st.text_input("Or type symptoms (comma-separated):", key="ai_sym_txt")
-        all_symptoms = list(set(st.session_state.get("ai_sym_sel", []) + [s.strip() for s in st.session_state.get("ai_sym_txt","").split(',') if s.strip()]))
-
-        if all_symptoms:
-            message, recommendations = recommend_doctors(all_symptoms)
-            st.session_state.recommendations = recommendations
-            st.session_state.doctor_message = message
-            st.info(message)
-        else:
-            st.warning("Please add at least one symptom to get AI suggestions.")
 
     # Book Beds/Cabins
     st.markdown("---")
