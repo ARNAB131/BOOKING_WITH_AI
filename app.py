@@ -384,7 +384,6 @@ for key, default in [
     ("seat_selected", ""),
     ("beds_avail_day", date.today()),
     ("selected_beds_day", None),
-    ("emergency_pick", ""),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -461,35 +460,77 @@ with col2:
         st.session_state.flow_step = "emergency"
 
 # ------------------------------------------------------------------------------------
-# EMERGENCY → Nearest Hospitals (auto-location + strong SELECT)
+# EMERGENCY → Auto-pick nearest + manual radio selection
 # ------------------------------------------------------------------------------------
 if st.session_state.flow_step == "emergency":
     st.subheader("🚑 Nearest Hospitals (Live distance & ETA)")
-    st.caption("Tap **Start Live Tracking**. Your location auto-fills; pick a hospital with **Select**.")
+    st.caption("Tap **Start Live Tracking** to auto-detect your location. We’ll pick the nearest hospital, and you can switch manually if needed.")
 
-    # Hidden inputs so JS can auto-update (no manual typing needed)
+    # Location fields (auto-filled by JS; user doesn't need to type)
     lat_val = st.text_input("Latitude", value=st.session_state.user_location["lat"] or "", key="lat_input")
     lon_val = st.text_input("Longitude", value=st.session_state.user_location["lon"] or "", key="lon_input")
-    pick_label = "__EMERGENCY_PICK_HOSPITAL__"
-    picked_hospital = st.text_input(pick_label, value=st.session_state.get("emergency_pick", ""), key="emergency_pick")
 
-    # If query param ?picked=... is present (JS sets it), consume & move forward
-    picked_from_url = st.query_params.get("picked")
+    # Minimal JS for live geolocation → updates the two Streamlit inputs
+    components.html(
+        """
+        <div style="display:flex;gap:8px;align-items:center;margin:.25rem 0 .75rem 0;">
+          <button id="start" style="padding:.45rem .9rem;border-radius:10px;border:1px solid #2a9d8f;color:#2a9d8f;background:#fff;cursor:pointer;">▶ Start Live Tracking</button>
+          <button id="stop"  style="padding:.45rem .9rem;border-radius:10px;border:1px solid #94a3b8;color:#475569;background:#fff;cursor:pointer;">⏸ Stop</button>
+          <span id="status" style="font-size:.9rem;color:#475569;margin-left:.25rem;"></span>
+        </div>
+        <script>
+          function byAria(label){
+            const all = window.parent.document.querySelectorAll('input');
+            for (let i=0;i<all.length;i++){
+              if (all[i].getAttribute('aria-label') === label) return all[i];
+            }
+            return null;
+          }
+          const latInput = byAria("Latitude");
+          const lonInput = byAria("Longitude");
+          const statusEl = document.getElementById("status");
+          let watchId = null;
 
-    if picked_from_url:
-        st.session_state.selected_hospital = picked_from_url
-        st.session_state.flow_step = "hospital"
-        # clear the param so refresh doesn't loop
-        try:
-            st.query_params.clear()
-        except Exception:
-            pass
+          function updateInputs(lat, lon){
+            if (statusEl) statusEl.textContent = "Lat: " + lat.toFixed(6) + ", Lon: " + lon.toFixed(6);
+            if (latInput){ latInput.value = lat.toFixed(6); latInput.dispatchEvent(new Event('input', {bubbles:true})); }
+            if (lonInput){ lonInput.value = lon.toFixed(6); lonInput.dispatchEvent(new Event('input', {bubbles:true})); }
+          }
 
-    # Persist lat/lon from hidden fields
+          document.getElementById("start").addEventListener("click", () => {
+            if (!navigator.geolocation){
+              alert("Geolocation not supported in this browser.");
+              return;
+            }
+            if (watchId !== null) return;
+            navigator.geolocation.getCurrentPosition((pos) => {
+              updateInputs(pos.coords.latitude, pos.coords.longitude);
+            });
+            watchId = navigator.geolocation.watchPosition((pos) => {
+              updateInputs(pos.coords.latitude, pos.coords.longitude);
+            }, (err) => {
+              console.log("Geo error", err);
+              alert("Unable to get location: " + err.message);
+            }, { enableHighAccuracy:true, maximumAge: 1000, timeout: 10000 });
+          });
+
+          document.getElementById("stop").addEventListener("click", () => {
+            if (watchId !== null){
+              navigator.geolocation.clearWatch(watchId);
+              watchId = null;
+              if (statusEl) statusEl.textContent = "Tracking paused.";
+            }
+          });
+        </script>
+        """,
+        height=80,
+    )
+
+    # Persist lat/lon
     try:
         st.session_state.user_location["lat"] = float(lat_val) if lat_val else None
         st.session_state.user_location["lon"] = float(lon_val) if lon_val else None
-    except:
+    except Exception:
         pass
 
     hospitals_df = load_hospitals()
@@ -497,188 +538,60 @@ if st.session_state.flow_step == "emergency":
         st.info("Upload or prepare `hospitals.csv` to see nearby hospitals.")
         st.stop()
 
-    # Prepare hospitals JSON for JS
-    rows = []
-    for _, r in hospitals_df.iterrows():
-        try:
-            rows.append({
-                "name": str(r["Hospital"]),
-                "addr": str(r["Address"]),
-                "lat": float(r["Latitude"]),
-                "lon": float(r["Longitude"]),
-            })
-        except Exception:
-            continue
-    hospitals_json = json.dumps(rows)
-    user_lat = st.session_state.user_location["lat"] or 0.0
-    user_lon = st.session_state.user_location["lon"] or 0.0
+    lat0 = st.session_state.user_location["lat"]
+    lon0 = st.session_state.user_location["lon"]
 
-    # HTML/JS with robust Select → sets hidden input AND URL ?picked=... (forces rerun)
-    em_html = """
-      <style>
-        .em-topbar { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; margin:.25rem 0 .75rem 0; }
-        .em-topbar button { padding:.45rem .9rem; border-radius:10px; border:1px solid #2a9d8f; color:#2a9d8f; background:#fff; cursor:pointer; }
-        .em-topbar button:hover { background:#e6fffa; }
-        .em-topbar .muted { font-size:.85rem; color:#475569; margin-left:.25rem; }
-        .em-search input { padding:.45rem .65rem; border:1px solid #e2e8f0; border-radius:8px; width:260px; }
-        .em-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap:12px; }
-        .em-card { border:1px solid #E2E8F0; border-radius:12px; background:#fff; padding:.85rem 1rem; display:flex; flex-direction:column; gap:.45rem; }
-        .em-title { font-weight:700; color:#0f172a; }
-        .em-addr { font-size:.85rem; color:#475569; }
-        .chips { display:inline-flex; gap:.5rem; flex-wrap:wrap; }
-        .chip  { display:inline-flex; align-items:center; padding:.2rem .55rem; font-size:.80rem; border-radius:999px; border:1px solid #E2E8F0; background:#F8FAFC; }
-        .chip strong { margin-left:.3rem; }
-        .row-end { display:flex; justify-content:flex-end; }
-        .btn-outline { border:1px solid #2a9d8f; color:#2a9d8f; background:#fff; padding:.35rem .8rem; border-radius:8px; cursor:pointer; }
-        .btn-outline:hover { background:#e6fffa; }
-      </style>
+    if lat0 is None or lon0 is None:
+        st.info("Tap **Start Live Tracking** to capture your location.")
+    else:
+        # Compute distance & ETA
+        def _row_calc(r):
+            try:
+                d = haversine_km(lat0, lon0, float(r["Latitude"]), float(r["Longitude"]))
+                return pd.Series({"Distance_km": d, "ETA_min": eta_minutes_from_distance_km(d)})
+            except Exception:
+                return pd.Series({"Distance_km": float("nan"), "ETA_min": 0})
 
-      <div class="em-topbar">
-        <div class="em-search"><input id="q" type="text" placeholder="Search hospitals..." /></div>
-        <button id="start">▶ Start Live Tracking</button>
-        <button id="stop">⏸ Stop</button>
-        <span class="muted" id="status">Lat: __USER_LAT__, Lon: __USER_LON__</span>
-      </div>
+        extra = hospitals_df.apply(_row_calc, axis=1)
+        hospitals_df = pd.concat([hospitals_df, extra], axis=1).sort_values("Distance_km")
+        hospitals_df = hospitals_df.reset_index(drop=True)
 
-      <div id="grid" class="em-grid"></div>
+        # Auto-pick nearest hospital
+        if not hospitals_df.empty:
+            nearest = hospitals_df.iloc[0]
+            auto_name = str(nearest["Hospital"])
+            auto_km = nearest["Distance_km"]
+            auto_eta = nearest["ETA_min"]
+            st.session_state.selected_hospital = auto_name  # auto-select
+            st.success(f"Nearest hospital auto-selected: **{auto_name}** — {auto_km:.2f} km (~{auto_eta} min)")
 
-      <script>
-        const hospitals = __HOSPITALS_JSON__;
-        let userLat = __USER_LAT_NUM__;
-        let userLon = __USER_LON_NUM__;
-        let watchId = null;
+        # Manual override via radio
+        labels = []
+        values = []
+        for _, r in hospitals_df.iterrows():
+            hname = str(r["Hospital"])
+            km = r["Distance_km"]
+            eta = r["ETA_min"]
+            lab = f"{hname} — {km:.2f} km (~{eta} min)"
+            labels.append(lab)
+            values.append(hname)
 
-        function haversineKm(lat1, lon1, lat2, lon2) {
-          const R = 6371.0;
-          const toRad = d => d * Math.PI / 180;
-          const dphi = toRad(lat2 - lat1);
-          const dl   = toRad(lon2 - lon1);
-          const p1   = toRad(lat1), p2 = toRad(lat2);
-          const a = Math.sin(dphi/2)**2 + Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2;
-          const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-          return R * c;
-        }
-        function etaFromDist(dKm) {
-          if (dKm <= 5)  return 15;
-          if (dKm <= 10) return 20;
-          if (dKm <= 20) return 30;
-          return Math.round(dKm * 2);
-        }
-        function byAria(label) {
-          const all = window.parent.document.querySelectorAll('input');
-          for (let i=0;i<all.length;i++) {
-            if (all[i].getAttribute('aria-label') === label) return all[i];
-          }
-          return null;
-        }
-        const hiddenPick = byAria("__PICK_LABEL__");
-        const latInput   = byAria("Latitude");
-        const lonInput   = byAria("Longitude");
-        const statusEl   = document.getElementById("status");
+        default_index = 0 if values else None
+        choice = st.radio("Or choose a different hospital:", options=range(len(values)), format_func=lambda i: labels[i], index=default_index if default_index is not None else 0)
+        chosen_name = values[choice] if values else None
 
-        function render(list) {
-          const enriched = list.map((h) => {
-            let d = (userLat || userLat===0) && (userLon || userLon===0) ? haversineKm(userLat, userLon, h.lat, h.lon) : NaN;
-            let eta = isNaN(d) ? null : etaFromDist(d);
-            return {...h, dKm: d, etaMin: eta};
-          }).sort((a,b) => (isNaN(a.dKm)?1:a.dKm) - (isNaN(b.dKm)?1:b.dKm));
+        if chosen_name and chosen_name != st.session_state.selected_hospital:
+            st.session_state.selected_hospital = chosen_name
 
-          const q = (document.getElementById("q").value || "").toLowerCase().trim();
-          const filtered = q ? enriched.filter(h => (h.name+" "+h.addr).toLowerCase().includes(q)) : enriched;
+        # Show a compact table, too
+        show_df = hospitals_df[["Hospital", "Address", "Distance_km", "ETA_min"]].rename(
+            columns={"Distance_km": "Distance (km)", "ETA_min": "ETA (min)"}
+        )
+        st.dataframe(show_df, use_container_width=True)
 
-          const grid = document.getElementById("grid");
-          grid.innerHTML = "";
-          filtered.forEach(h => {
-            const kmTxt  = isNaN(h.dKm) ? "—" : (h.dKm.toFixed(2) + " km");
-            const etaTxt = (h.etaMin==null) ? "—" : ("~" + h.etaMin + " min");
-            const card = document.createElement("div");
-            card.className = "em-card";
-            card.innerHTML = `
-              <div class="em-title">${h.name}</div>
-              <div class="em-addr">${h.addr}</div>
-              <div class="chips">
-                <span class="chip">📏 <strong class="km">${kmTxt}</strong></span>
-                <span class="chip">⏱️ <strong class="eta">${etaTxt}</strong></span>
-              </div>
-              <div class="row-end"><button class="btn-outline">Select</button></div>
-            `;
-            card.querySelector(".btn-outline").addEventListener("click", () => {
-              if (hiddenPick) {
-                hiddenPick.value = h.name;
-                hiddenPick.dispatchEvent(new Event('input', { bubbles: true }));
-                hiddenPick.dispatchEvent(new Event('change', { bubbles: true }));
-              }
-              // Force a rerun by updating query param ?picked=...
-              try {
-                const u = new URL(window.parent.location.href);
-                u.searchParams.set('picked', h.name);
-                window.parent.location = u.toString();
-              } catch(e) {
-                // fallback: reload (the hidden input will carry the value)
-                window.parent.location.reload();
-              }
-            });
-            grid.appendChild(card);
-          });
-        }
-
-        function updateCoords(lat, lon) {
-          userLat = lat; userLon = lon;
-          render(hospitals);
-          if (statusEl) statusEl.textContent = `Lat: ${lat.toFixed(6)}, Lon: ${lon.toFixed(6)}`;
-          if (latInput) { latInput.value = lat.toFixed(6); latInput.dispatchEvent(new Event('input', {bubbles:true})); }
-          if (lonInput) { lonInput.value = lon.toFixed(6); lonInput.dispatchEvent(new Event('input', {bubbles:true})); }
-        }
-
-        render(hospitals);
-
-        const startBtn = document.getElementById("start");
-        const stopBtn  = document.getElementById("stop");
-
-        startBtn.addEventListener("click", () => {
-          if (!navigator.geolocation) {
-            alert("Geolocation not supported in this browser.");
-            return;
-          }
-          if (watchId !== null) return;
-          navigator.geolocation.getCurrentPosition((pos) => {
-            updateCoords(pos.coords.latitude, pos.coords.longitude);
-          });
-          watchId = navigator.geolocation.watchPosition((pos) => {
-            updateCoords(pos.coords.latitude, pos.coords.longitude);
-          }, (err) => {
-            console.log("Geo error", err);
-            alert("Unable to get location: " + err.message);
-          }, { enableHighAccuracy:true, maximumAge: 1000, timeout: 10000 });
-        });
-
-        stopBtn.addEventListener("click", () => {
-          if (watchId !== null) {
-            navigator.geolocation.clearWatch(watchId);
-            watchId = null;
-          }
-        });
-
-        document.getElementById("q").addEventListener("input", () => render(hospitals));
-      </script>
-    """
-    em_html = (
-        em_html
-        .replace("__HOSPITALS_JSON__", hospitals_json)
-        .replace("__USER_LAT__", f"{user_lat:.6f}")
-        .replace("__USER_LON__", f"{user_lon:.6f}")
-        .replace("__USER_LAT_NUM__", str(user_lat))
-        .replace("__USER_LON_NUM__", str(user_lon))
-        .replace("__PICK_LABEL__", pick_label)
-    )
-    components.html(em_html, height=650)
-
-    # Primary path 1: via URL ?picked=... handled above (sets flow_step)
-    # Primary path 2: if hidden input changed (no reload path), proceed here
-    if picked_hospital and not picked_from_url:
-        st.session_state.selected_hospital = picked_hospital
-        st.session_state.flow_step = "hospital"
-        st.session_state.emergency_pick = ""
+        # Proceed
+        if st.button("Continue ➜"):
+            st.session_state.flow_step = "hospital"
 
 # ------------------------------------------------------------------------------------
 # HOSPITAL/DOCTORS PAGE (Normal Booking logic unchanged)
