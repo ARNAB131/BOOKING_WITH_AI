@@ -466,35 +466,52 @@ if st.session_state.flow_step == "emergency":
     st.subheader("🚑 Nearest Hospitals (Live distance & ETA)")
     st.caption("Tap **Start Live Tracking** to auto-detect your location. We’ll pick the nearest hospital, and you can switch manually if needed.")
 
-    # Location fields (auto-filled by JS; user doesn't need to type)
-    lat_val = st.text_input("Latitude", value=st.session_state.user_location["lat"] or "", key="lat_input")
-    lon_val = st.text_input("Longitude", value=st.session_state.user_location["lon"] or "", key="lon_input")
+    # Read lat/lon from URL query params (set by JS), using new API
+    params = st.query_params
+    # params.get returns a string (new API). But be defensive if a list-like is returned.
+    def _as_str(v):
+        if isinstance(v, list) and v:
+            return v[0]
+        return v
+    qp_lat = _as_str(params.get("lat"))
+    qp_lon = _as_str(params.get("lon"))
 
-    # Minimal JS for live geolocation → updates the two Streamlit inputs
+    # If URL contains lat/lon, persist to session
+    if qp_lat and qp_lon:
+        try:
+            st.session_state.user_location["lat"] = float(qp_lat)
+            st.session_state.user_location["lon"] = float(qp_lon)
+        except Exception:
+            pass
+
+    # Show small control panel (JS writes lat/lon to URL and reloads the app)
     components.html(
         """
         <div style="display:flex;gap:8px;align-items:center;margin:.25rem 0 .75rem 0;">
           <button id="start" style="padding:.45rem .9rem;border-radius:10px;border:1px solid #2a9d8f;color:#2a9d8f;background:#fff;cursor:pointer;">▶ Start Live Tracking</button>
           <button id="stop"  style="padding:.45rem .9rem;border-radius:10px;border:1px solid #94a3b8;color:#475569;background:#fff;cursor:pointer;">⏸ Stop</button>
-          <span id="status" style="font-size:.9rem;color:#475569;margin-left:.25rem;"></span>
+          <span id="status" style="font-size:.9rem;color:#475569;margin-left:.25rem;">Waiting for location…</span>
         </div>
         <script>
-          function byAria(label){
-            const all = window.parent.document.querySelectorAll('input');
-            for (let i=0;i<all.length;i++){
-              if (all[i].getAttribute('aria-label') === label) return all[i];
-            }
-            return null;
-          }
-          const latInput = byAria("Latitude");
-          const lonInput = byAria("Longitude");
-          const statusEl = document.getElementById("status");
           let watchId = null;
+          const statusEl = document.getElementById("status");
 
-          function updateInputs(lat, lon){
+          function reloadWith(lat, lon){
+            try {
+              const u = new URL(window.parent.location.href);
+              u.searchParams.set('lat', lat.toFixed(6));
+              u.searchParams.set('lon', lon.toFixed(6));
+              window.parent.location = u.toString();
+            } catch(e) {
+              // fallback
+              window.parent.location.reload();
+            }
+          }
+
+          function onFirstFix(lat, lon){
             if (statusEl) statusEl.textContent = "Lat: " + lat.toFixed(6) + ", Lon: " + lon.toFixed(6);
-            if (latInput){ latInput.value = lat.toFixed(6); latInput.dispatchEvent(new Event('input', {bubbles:true})); }
-            if (lonInput){ lonInput.value = lon.toFixed(6); lonInput.dispatchEvent(new Event('input', {bubbles:true})); }
+            // Immediately reload the app with ?lat&lon so Python can react.
+            reloadWith(lat, lon);
           }
 
           document.getElementById("start").addEventListener("click", () => {
@@ -504,13 +521,16 @@ if st.session_state.flow_step == "emergency":
             }
             if (watchId !== null) return;
             navigator.geolocation.getCurrentPosition((pos) => {
-              updateInputs(pos.coords.latitude, pos.coords.longitude);
-            });
+              onFirstFix(pos.coords.latitude, pos.coords.longitude);
+            }, (err) => {
+              alert("Unable to get location: " + err.message);
+            }, { enableHighAccuracy:true, timeout: 10000 });
+
+            // Optional: keep tracking to keep status fresh (not needed for backend)
             watchId = navigator.geolocation.watchPosition((pos) => {
-              updateInputs(pos.coords.latitude, pos.coords.longitude);
+              if (statusEl) statusEl.textContent = "Lat: " + pos.coords.latitude.toFixed(6) + ", Lon: " + pos.coords.longitude.toFixed(6);
             }, (err) => {
               console.log("Geo error", err);
-              alert("Unable to get location: " + err.message);
             }, { enableHighAccuracy:true, maximumAge: 1000, timeout: 10000 });
           });
 
@@ -526,13 +546,6 @@ if st.session_state.flow_step == "emergency":
         height=80,
     )
 
-    # Persist lat/lon
-    try:
-        st.session_state.user_location["lat"] = float(lat_val) if lat_val else None
-        st.session_state.user_location["lon"] = float(lon_val) if lon_val else None
-    except Exception:
-        pass
-
     hospitals_df = load_hospitals()
     if hospitals_df.empty:
         st.info("Upload or prepare `hospitals.csv` to see nearby hospitals.")
@@ -542,7 +555,7 @@ if st.session_state.flow_step == "emergency":
     lon0 = st.session_state.user_location["lon"]
 
     if lat0 is None or lon0 is None:
-        st.info("Tap **Start Live Tracking** to capture your location.")
+        st.info("Click **Start Live Tracking**. The page will refresh and show nearby hospitals automatically.")
     else:
         # Compute distance & ETA
         def _row_calc(r):
@@ -577,7 +590,12 @@ if st.session_state.flow_step == "emergency":
             values.append(hname)
 
         default_index = 0 if values else None
-        choice = st.radio("Or choose a different hospital:", options=range(len(values)), format_func=lambda i: labels[i], index=default_index if default_index is not None else 0)
+        choice = st.radio(
+            "Or choose a different hospital:",
+            options=range(len(values)),
+            format_func=lambda i: labels[i],
+            index=default_index if default_index is not None else 0
+        )
         chosen_name = values[choice] if values else None
 
         if chosen_name and chosen_name != st.session_state.selected_hospital:
