@@ -474,18 +474,14 @@ if st.session_state.flow_step == "emergency":
     picked_hospital = st.text_input(pick_label, value=st.session_state.get("emergency_pick", ""), key="emergency_pick")
 
     # If query param ?picked=... is present (JS sets it), consume & move forward
-    try:
-        qp = st.experimental_get_query_params()  # works across Streamlit versions
-        picked_from_url = qp.get("picked", [None])[0]
-    except Exception:
-        picked_from_url = None
+    picked_from_url = st.query_params.get("picked")
 
     if picked_from_url:
         st.session_state.selected_hospital = picked_from_url
         st.session_state.flow_step = "hospital"
         # clear the param so refresh doesn't loop
         try:
-            st.experimental_set_query_params()
+            st.query_params.clear()
         except Exception:
             pass
 
