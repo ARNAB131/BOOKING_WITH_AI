@@ -783,7 +783,7 @@ if st.session_state.flow_step in ("hospital", "doctors"):
         function startDictation() {
             if (!('webkitSpeechRecognition' in window)) {
                 document.getElementById("output").innerText = "❌ Speech recognition not supported in this browser.";
-                return.
+                return;
             }
             const recognition = new webkitSpeechRecognition();
             recognition.lang = "en-US";
@@ -838,11 +838,11 @@ if st.session_state.flow_step in ("hospital", "doctors"):
         st.markdown(f"**Chamber:** {selected_info['Chamber']}")
         visiting_time_str = selected_info['Visiting Time']
 
-        today = datetime.today()
-        selected_date = st.date_input("Choose appointment date:", min_value=today)
+        today_d = date.today()
+        selected_date = st.date_input("Choose appointment date:", min_value=today_d)
         # compute available slots for that doctor/date
         all_slots = generate_slots(visiting_time_str)
-        already = booked_slot_times_for(selected_doctor, selected_date.date())
+        already = booked_slot_times_for(selected_doctor, selected_date)
         available_slots = [s for s in all_slots if s not in already]
         if not available_slots:
             st.warning("All time frames are booked for this doctor on the selected date.")
@@ -912,11 +912,11 @@ if st.session_state.flow_step in ("hospital", "doctors"):
             with st.expander(f"{idx+1}. Dr. {doc['Doctor']} - {doc['Specialization']}"):
                 st.markdown(f"**Chamber:** {doc['Chamber']}")
                 # date first
-                appt_date = st.date_input(f"Choose date for Dr. {doc['Doctor']}", key=f"date_{idx}", min_value=datetime.today())
+                appt_date = st.date_input(f"Choose date for Dr. {doc['Doctor']}", key=f"date_{idx}", min_value=date.today())
                 # available slots only
                 visiting_time_str = doc.get("Visiting Time", "")
                 all_slots = doc.get("Slots") or generate_slots(visiting_time_str)
-                already = booked_slot_times_for(doc["Doctor"], appt_date.date())
+                already = booked_slot_times_for(doc["Doctor"], appt_date)
                 avail = [s for s in all_slots if s not in already]
                 if not avail:
                     st.warning("All time frames are booked for this doctor on the selected date.")
