@@ -565,7 +565,6 @@ if st.session_state.flow_step == "emergency":
             st.markdown(f"- 🧭 **Navigation:** [Open Google Maps to {nearest['Hospital']}]({maps_url})")
             st.markdown(f"- 📍 **Share my current location:** {share_my_loc}")
 
-            # Copy share link button (no f-string to avoid brace escaping issues)
             copy_html = """
             <button id="copy" style="margin-top:6px;padding:6px 10px;border:1px solid #2a9d8f;border-radius:8px;background:#fff;color:#2a9d8f;cursor:pointer;">Copy share link</button>
             <script>
@@ -583,7 +582,6 @@ if st.session_state.flow_step == "emergency":
             """
             components.html(copy_html.replace("__LINK__", share_my_loc), height=50)
 
-            # Call ambulance tel link (use your local emergency number if needed)
             st.markdown("- ☎️ **Call Ambulance:** [Tap to call 108](tel:108)")
         except Exception:
             pass
@@ -728,13 +726,13 @@ if st.session_state.flow_step in ("hospital", "doctors"):
         st.session_state.flow_step = "beds"
 
 # ------------------------------------------------------------------------------------
-# BEDS/CABINS (Idea 3) — BookMyShow-style grid with per-date availability
+# BEDS/CABINS (Idea 3) — Checkbox grid (no typing)
 # +++ IDEA 5: Waitlist option when nothing is available (and optional proactive join)
 # ------------------------------------------------------------------------------------
 if st.session_state.flow_step == "beds":
     hospital_name_for_beds = st.session_state.selected_hospital or "Doctigo Partner Hospital"
     st.subheader(f"🛏️ Beds & Cabins – {hospital_name_for_beds}")
-    st.caption("Pick a date and tap a square. Legend: ⬜ Available, 🟩 Selected, ▭ Sold")
+    st.caption("Pick a date, choose a type, then tick **one** box to select your unit. (▭ Sold = unavailable)")
 
     # choose date to view availability (widget manages st.session_state['beds_avail_day'])
     beds_day = st.date_input(
@@ -742,6 +740,7 @@ if st.session_state.flow_step == "beds":
         value=st.session_state.get("beds_avail_day", date.today()),
         key="beds_avail_day"
     )
+    day_str = beds_day.strftime("%Y-%m-%d")
 
     tiers = [
         {"tier": "General Bed",   "price": 100,  "features": ["1 bed","1 chair","bed table"], "ids": [f"G-{i}" for i in range(1,41)], "cols": 10},
@@ -753,106 +752,67 @@ if st.session_state.flow_step == "beds":
     tier_obj = next(t for t in tiers if t["tier"] == pick_tier)
 
     inv = get_inventory(hospital_name_for_beds, tier_obj["tier"], beds_day)
-    sold = set(inv[inv["Status"] == "booked"]["UnitID"].tolist())
+    sold = set(inv[inv["Status"] == "booked"]["UnitID"].astype(str).tolist())
 
     with st.expander(f"ℹ️ What is included in {pick_tier}?"):
         st.markdown(f"**₹{tier_obj['price']} per night**")
         st.markdown("- " + "\n- ".join(tier_obj["features"]))
 
-    # Hidden text input to receive selection from HTML
-    hidden_label = f"__selected_unit__[{hospital_name_for_beds}]__[{pick_tier}]__[{beds_day}]"
-    selected_unit_input = st.text_input(hidden_label, value=st.session_state.get("seat_selected", ""), key="unit_selected_hidden")
-
+    # ---- Checkbox grid (one selection at a time) ----
     ids = tier_obj["ids"]
     cols = tier_obj["cols"]
-    preselected = selected_unit_input
 
-    # Build grid (pure HTML, not an f-string—no brace escaping issues)
-    html_cells = ""
-    for uid in ids:
-        status = "sold" if uid in sold else "available"
-        cls = "seat " + ("sold" if status == "sold" else ("selected" if uid == preselected else "available"))
-        html_cells += '<div class="{cls}" data-id="{uid}" data-status="{status}">{uid}</div>'.format(cls=cls, uid=uid, status=status)
+    # Ensure previous selection doesn't bleed into a different tier/date
+    if st.session_state.get("seat_selected") not in ids:
+        st.session_state.seat_selected = ""
 
-    rows = math.ceil(len(ids) / cols)
-    grid_css = """
-    <style>
-      .seat-grid {
-        display: grid;
-        grid-template-columns: repeat(REP, 36px);
-        gap: 8px;
-        margin: 12px 0 4px 0;
-      }
-      .seat {
-        width: 36px; height: 32px; line-height: 32px;
-        border: 2px solid #2a9d8f; border-radius: 6px;
-        text-align: center; font-size: 11px; user-select: none; cursor: pointer;
-        background: #fff; color: #2a9d8f;
-      }
-      .seat.selected {
-        background: #2a9d8f; color: #fff; font-weight: 700;
-      }
-      .seat.sold {
-        background: #e5e5e5; border-color: #c9c9c9; color: #8a8a8a; cursor: not-allowed;
-      }
-      .legend { display:flex; gap:16px; align-items:center; margin-top:8px; }
-      .box { width:18px; height:14px; border-radius:4px; display:inline-block; margin-right:6px; border:2px solid #2a9d8f; }
-      .box.sel { background:#2a9d8f; }
-      .box.sold { background:#e5e5e5; border-color:#c9c9c9; }
-    </style>
-    """.replace("REP", str(cols))
-    html_body = """
-    <div class="seat-grid" id="grid">__CELLS__</div>
-    <div class="legend">
-      <span><span class="box"></span>Available</span>
-      <span><span class="box sel"></span>Selected</span>
-      <span><span class="box sold"></span>Sold</span>
-    </div>
-    <script>
-      function findHiddenInput(labelText){
-        const inputs = window.parent.document.querySelectorAll('input[type="text"]');
-        for (let i=0;i<inputs.length;i++){
-          const prev = inputs[i].previousSibling;
-          if (prev && prev.textContent && prev.textContent.includes(labelText)) return inputs[i];
-        }
-        return null;
-      }
-      const hidden = findHiddenInput("__LABEL__");
-      function selectOne(el){
-        if (!hidden) return;
-        if (el.classList.contains('sold')) return;
-        document.querySelectorAll('#grid .seat').forEach(s => {
-          if (!s.classList.contains('sold')) s.classList.remove('selected');
-        });
-        el.classList.add('selected');
-        hidden.value = el.dataset.id;
-        hidden.dispatchEvent(new Event('input', { bubbles: true }));
-      }
-      document.querySelectorAll('#grid .seat').forEach(el => {
-        el.addEventListener('click', () => selectOne(el));
-      });
-    </script>
-    """.replace("__CELLS__", html_cells).replace("__LABEL__", hidden_label)
-    components.html(grid_css + html_body, height=(rows * 44 + 120))
+    key_prefix = f"unit_{pick_tier}_{day_str}_"
+
+    def _select_unit(sel_uid, id_list, prefix):
+        # Mark only sel_uid as checked; update global selection
+        st.session_state.seat_selected = sel_uid
+        for u in id_list:
+            st.session_state[f"{prefix}{u}"] = (u == sel_uid)
+
+    # Render grid
+    total = len(ids)
+    rows = math.ceil(total / cols)
+    for r in range(rows):
+        row_ids = ids[r*cols:(r+1)*cols]
+        row_cols = st.columns(len(row_ids))
+        for c, uid in enumerate(row_ids):
+            disabled = uid in sold
+            label = f"{uid}" + (" ▭" if disabled else "")
+            cb_key = f"{key_prefix}{uid}"
+            row_cols[c].checkbox(
+                label,
+                key=cb_key,
+                value=(st.session_state.get("seat_selected") == uid and not disabled),
+                disabled=disabled,
+                on_change=_select_unit,
+                args=(uid, ids, key_prefix),
+                help="Tick to select this unit" if not disabled else "Already booked"
+            )
 
     # Availability summary (for waitlist logic)
     available_units = [uid for uid in ids if uid not in sold]
 
+    # Display current selection
     st.markdown("#### Your selection")
-    if selected_unit_input:
-        st.success(f"Selected: **{selected_unit_input}** for **{beds_day.strftime('%d %b %Y')}**")
+    selected_unit = st.session_state.get("seat_selected", "")
+    if selected_unit:
+        st.success(f"Selected: **{selected_unit}** for **{beds_day.strftime('%d %b %Y')}**")
     else:
-        st.info("No unit selected yet.")
+        st.info("No unit selected yet. Tick any available box above.")
 
-    if st.button("Next ➜", disabled=not bool(selected_unit_input)):
+    if st.button("Next ➜", disabled=not bool(selected_unit)):
         st.session_state.bed_choice = {
             "tier": tier_obj["tier"],
-            "unit_id": selected_unit_input,
+            "unit_id": selected_unit,
             "price": tier_obj["price"],
             "features": tier_obj["features"],
         }
-        st.session_state.seat_selected = selected_unit_input
-        st.session_state.selected_beds_day = beds_day   # store copy if needed (NOTE: don't set the widget key here)
+        st.session_state.selected_beds_day = beds_day
         st.session_state.flow_step = "details"
 
     # --- IDEA 5: Join Waitlist (when sold out OR proactively)
@@ -998,7 +958,6 @@ if st.session_state.get("booked", False):
     st.success(f"✅ Appointment Booked with Dr. {st.session_state.booked_doctor} at {st.session_state.slot}")
 
     # Save appointment
-    # NOTE: This block uses the older variables; kept for compatibility only.
     doctor_df_for_save = load_doctors_file()
     chamber_val = ""
     if not doctor_df_for_save.empty:
