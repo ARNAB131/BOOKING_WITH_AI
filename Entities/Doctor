@@ -1,0 +1,49 @@
+{
+  "name": "Doctor",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Doctor's full name"
+    },
+    "specialization": {
+      "type": "string",
+      "description": "Medical specialization"
+    },
+    "hospital": {
+      "type": "string",
+      "description": "Hospital name"
+    },
+    "chamber": {
+      "type": "string",
+      "description": "Chamber location"
+    },
+    "visiting_hours": {
+      "type": "string",
+      "description": "Available visiting hours"
+    },
+    "available_slots": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Available time slots"
+    },
+    "experience": {
+      "type": "string",
+      "description": "Years of experience"
+    }
+  },
+  "required": [
+    "name",
+    "specialization"
+  ],
+  "rls": {
+    "read": {},
+    "write": {
+      "$or": [
+        {
+          "created_by": "{{user.email}}"
+        },
+        {
+ 
