@@ -592,70 +592,6 @@ for k,v in defaults.items():
         st.session_state[k] = v
 
 # ------------------------------------------------------------------------------------
-# Bulk Appointment Upload (kept)
-# ------------------------------------------------------------------------------------
-st.markdown("##  Bulk Appointment Upload")
-uploaded_file = st.file_uploader("Upload patient list (CSV or PDF)", type=["csv", "pdf"])
-if uploaded_file:
-    try:
-        if uploaded_file.name.endswith(".csv"):
-            df_bulk = pd.read_csv(uploaded_file)
-        elif uploaded_file.name.endswith(".pdf"):
-            text = ""
-            doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-            for page in doc:
-                text += page.get_text()
-            rows = [line.strip() for line in text.split('\n') if 'Name:' in line and 'Symptoms:' in line]
-            data = []
-            for row in rows:
-                parts = row.split(',')
-                name = parts[0].split('Name:')[1].strip()
-                symptoms = parts[1].split('Symptoms:')[1].strip()
-                data.append({"Patient Name": name, "Symptoms": symptoms})
-            df_bulk = pd.DataFrame(data)
-        else:
-            st.warning("Unsupported file format")
-            df_bulk = pd.DataFrame()
-
-        if not df_bulk.empty:
-            st.success(f"✅ Loaded {len(df_bulk)} patients. Starting auto booking...")
-            try:
-                for _, row in df_bulk.iterrows():
-                    name = row.get("Patient Name","")
-                    symptoms_list = [s.strip() for s in str(row.get("Symptoms","")).split(',') if s.strip()]
-                    msg, recs = recommend_doctors(symptoms_list)
-                    if not recs:
-                        continue
-                    selected = recs[0]
-                    doctor_name = selected['Doctor']
-                    chamber_val = selected.get('Chamber', '')
-                    visiting_time = selected.get('Visiting Time', '')
-                    today_date = datetime.today().date()
-                    avail = filter_future_slots_for_date(visiting_time, today_date, doctor_name)
-                    if not avail:
-                        continue
-                    slot_time = avail[0]
-                    full_slot = f"{slot_time} on {today_date.strftime('%d %B %Y')}"
-                    hospitals_df = load_hospitals()
-                    hosp_name = detect_hospital_for_chamber(chamber_val, hospitals_df) or st.session_state.get("selected_hospital")
-                    dist_km, eta_min = compute_distance_and_eta(st.session_state.get("user_location"), hosp_name, hospitals_df)
-                    save_appointment_row(
-                        patient_name=name,
-                        symptoms='; '.join(symptoms_list),
-                        doctor=doctor_name,
-                        chamber=chamber_val,
-                        slot_full=full_slot,
-                        visiting_time_str=visiting_time,
-                        distance_km=dist_km,
-                        eta_min=eta_min
-                    )
-                st.success("✅ Auto-booking finished (unique per time frame per day).")
-            except Exception as e_inner:
-                st.error(f"Error during auto-booking loop: {e_inner}")
-    except Exception as e:
-        st.error(f"Error processing bulk upload: {e}")
-
-# ------------------------------------------------------------------------------------
 # HOME — two buttons
 # ------------------------------------------------------------------------------------
 st.title("🤖 Doctigo – AI Doctor & Bed/Cabin Booking")
@@ -1150,3 +1086,4 @@ else:
 
 st.markdown("---")
 st.caption("Built with ❤️ by Doctigo AI Booking System")
+
