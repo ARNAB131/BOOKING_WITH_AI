@@ -1,0 +1,49 @@
+{
+  "name": "Hospital",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Hospital name"
+    },
+    "address": {
+      "type": "string",
+      "description": "Full address"
+    },
+    "latitude": {
+      "type": "number",
+      "description": "GPS latitude"
+    },
+    "longitude": {
+      "type": "number",
+      "description": "GPS longitude"
+    },
+    "phone": {
+      "type": "string",
+      "description": "Contact number"
+    },
+    "emergency_contact": {
+      "type": "string",
+      "description": "Emergency contact number"
+    }
+  },
+  "required": [
+    "name",
+    "address"
+  ],
+  "rls": {
+    "read": {},
+    "write": {
+      "$or": [
+        {
+          "created_by": "{{user.email}}"
+        },
+        {
+          "user_condition": {
+            "role": "admin"
+          }
+        }
+      ]
+    }
+  }
+}
