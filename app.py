@@ -189,7 +189,7 @@ def get_hospital_coords(hospital_name: str, hospitals_df: pd.DataFrame):
     except Exception:
         return None
 
-# NEW: speed-aware ETA (with fallback buckets)
+# Speed-aware ETA
 def _bucket_eta(distance_km: float) -> int:
     if distance_km <= 5:
         return 15
@@ -202,8 +202,7 @@ def _bucket_eta(distance_km: float) -> int:
 def travel_eta_minutes(distance_km: float, speed_kmph: float | None = None) -> int:
     """
     If speed is provided, use time = distance / speed.
-    Otherwise fall back to the previous bucketed estimate.
-    Always return a rounded integer minutes with sensible lower bound.
+    Otherwise fall back to buckets. Returns integer minutes.
     """
     if distance_km is None or distance_km <= 0:
         return 5
@@ -271,8 +270,53 @@ def save_appointment_row(patient_name, symptoms, doctor, chamber, slot_full, vis
         writer.writerow(new_row)
     return True, "✅ Appointment booked and saved.", serial
 
+# --- Static mini-map helper (no internet needed) ------------------------------------
+def render_static_map(user_lat, user_lon, hosp_lat, hosp_lon):
+    """
+    Renders a tiny static map (lat/lon axes) with:
+      • circle = user
+      • square = hospital
+      • straight line between them (not a road route)
+    Returns a BytesIO PNG buffer.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from io import BytesIO
+
+    ulat, ulon = float(user_lat), float(user_lon)
+    hlat, hlon = float(hosp_lat), float(hosp_lon)
+
+    lats = [ulat, hlat]
+    lons = [ulon, hlon]
+    pad_lat = max(0.01, (max(lats) - min(lats)) * 0.2)
+    pad_lon = max(0.01, (max(lons) - min(lons)) * 0.2)
+
+    fig, ax = plt.subplots(figsize=(4, 4), dpi=150)
+    ax.set_xlim(min(lons) - pad_lon, max(lons) + pad_lon)
+    ax.set_ylim(min(lats) - pad_lat, max(lats) + pad_lat)
+
+    # Line between points
+    ax.plot([ulon, hlon], [ulat, hlat], linewidth=1.5)
+
+    # Points
+    ax.scatter([ulon], [ulat], s=35, label="You", zorder=3)
+    ax.scatter([hlon], [hlat], s=55, marker="s", label="Hospital", zorder=3)
+
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_title("Approx path (straight-line)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left", frameon=True)
+
+    buf = BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
 # --- PDF helpers --------------------------------------------------------------------
-# NEW: small utility to format coordinates
 def _fmt_coords(lat, lon):
     try:
         if lat is None or lon is None:
@@ -284,10 +328,9 @@ def _fmt_coords(lat, lon):
 def generate_pdf_receipt(patient_name, doctor, chamber, slot, symptoms,
                          phone="", email="", distance_km=None, eta_min=None,
                          user_lat=None, user_lon=None, hospital_name=None,
-                         hosp_lat=None, hosp_lon=None, avg_speed=None):
+                         hosp_lat=None, hosp_lon=None, avg_speed=None, mini_map_path=None):
     """
-    (Kept for compatibility if you use it elsewhere.)
-    Now prints Phone, Email, and travel info too.
+    Kept for compatibility; prints Phone, Email, travel info, and can embed a mini map.
     """
     pdf = FPDF()
     pdf.add_page()
@@ -301,8 +344,8 @@ def generate_pdf_receipt(patient_name, doctor, chamber, slot, symptoms,
     pdf.ln(5)
     pdf.set_font("Arial", "", 12)
     pdf.cell(0, 8, pdfsafe(f"Patient Name: {patient_name}"), ln=True)
-    pdf.cell(0, 8, pdfsafe(f"Phone: {phone}"), ln=True)     # NEW
-    pdf.cell(0, 8, pdfsafe(f"Email: {email}"), ln=True)     # NEW
+    pdf.cell(0, 8, pdfsafe(f"Phone: {phone}"), ln=True)
+    pdf.cell(0, 8, pdfsafe(f"Email: {email}"), ln=True)
     pdf.cell(0, 8, pdfsafe(f"Doctor: Dr. {doctor}"), ln=True)
     pdf.cell(0, 8, pdfsafe(f"Chamber: {chamber}"), ln=True)
     pdf.cell(0, 8, pdfsafe(f"Slot: {slot}"), ln=True)
@@ -312,6 +355,17 @@ def generate_pdf_receipt(patient_name, doctor, chamber, slot, symptoms,
         pdf.cell(0, 8, pdfsafe(f"To (hospital): {_fmt_coords(hosp_lat, hosp_lon)}"), ln=True)
     pdf.multi_cell(0, 8, pdfsafe(f"Symptoms: {symptoms}"))
     pdf.cell(0, 8, pdfsafe(f"Issued On: {datetime.now().strftime('%d %B %Y, %I:%M %p')}"), ln=True)
+
+    # Mini map embed if available
+    if mini_map_path and os.path.exists(mini_map_path):
+        pdf.ln(4)
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 8, pdfsafe("Map Preview"), ln=True)
+        try:
+            pdf.image(mini_map_path, w=90)  # scale to fit
+        except Exception:
+            pass
+
     pdf.ln(10)
     pdf.set_font("Courier", "B", 11)
     pdf.set_text_color(150)
@@ -321,8 +375,8 @@ def generate_pdf_receipt(patient_name, doctor, chamber, slot, symptoms,
     pdf.set_font("Arial", "", 12)
     pdf.cell(0, 8, pdfsafe("Hospital Copy"), ln=True)
     pdf.cell(0, 8, pdfsafe(f"Patient Name: {patient_name}"), ln=True)
-    pdf.cell(0, 8, pdfsafe(f"Phone: {phone}"), ln=True)     # NEW
-    pdf.cell(0, 8, pdfsafe(f"Email: {email}"), ln=True)     # NEW
+    pdf.cell(0, 8, pdfsafe(f"Phone: {phone}"), ln=True)
+    pdf.cell(0, 8, pdfsafe(f"Email: {email}"), ln=True)
     pdf.cell(0, 8, pdfsafe(f"Doctor: Dr. {doctor}"), ln=True)
     pdf.cell(0, 8, pdfsafe(f"Chamber: {chamber}"), ln=True)
     pdf.cell(0, 8, pdfsafe(f"Slot: {slot}"), ln=True)
@@ -343,8 +397,20 @@ def generate_pdf_receipt(patient_name, doctor, chamber, slot, symptoms,
 def generate_full_pdf(hospital_name, patient, appointment, bed_choice):
     """
     Combined PDF for appointment + bed/cabin.
-    Includes phone/email + distance/ETA + coordinates.
+    Includes phone/email + distance/ETA + coordinates + embedded mini-map if available.
     """
+    # Build mini map file (temp) if coords exist
+    mini_map_path = None
+    try:
+        if appointment and appointment.get("user_lat") is not None and appointment.get("user_lon") is not None \
+           and appointment.get("hosp_lat") is not None and appointment.get("hosp_lon") is not None:
+            buf = render_static_map(appointment["user_lat"], appointment["user_lon"], appointment["hosp_lat"], appointment["hosp_lon"])
+            mini_map_path = os.path.join("data", "doctigo_mini_map.png")
+            with open(mini_map_path, "wb") as f:
+                f.write(buf.getbuffer())
+    except Exception:
+        mini_map_path = None
+
     pdf = FPDF()
     pdf.add_page()
 
@@ -358,7 +424,7 @@ def generate_full_pdf(hospital_name, patient, appointment, bed_choice):
     pdf.set_font("Arial", "", 11)
     pdf.cell(0, 5, pdfsafe("----------------------------------------"), ln=True, align='C')
 
-    # Patient Details (now guaranteed to show phone/email)
+    # Patient Details
     pdf.ln(4)
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 8, pdfsafe("Patient Details"), ln=True)
@@ -398,6 +464,16 @@ Slot: {appointment.get('slot','')}{serial_text}{dist_text}
 Symptoms: {appointment.get('symptoms','')}
 """.strip()
         pdf.multi_cell(0, 7, pdfsafe(ap_text))
+
+        # Embed mini map if available
+        if mini_map_path and os.path.exists(mini_map_path):
+            pdf.ln(2)
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(0, 8, pdfsafe("Map Preview"), ln=True)
+            try:
+                pdf.image(mini_map_path, w=100)
+            except Exception:
+                pass
 
     # Bed/Cabin
     if bed_choice:
@@ -487,7 +563,7 @@ def mark_booked_range(hospital: str, tier: str, unit_id: str, start_day: date, e
     last = end_day or start_day
     cur = start_day
     while cur <= last:
-        mark_booked(hospital, tier, cur)
+        mark_booked(hospital, tier, unit_id, cur)
         cur += timedelta(days=1)
 
 def reset_inventory_for_date(hospital: str, tier: str, day: date):
@@ -652,7 +728,7 @@ defaults = {
     "details_step": 0,
     "patient_details": {"name":"", "phone":"", "gender":"", "age":"", "email":"", "address":""},
     "doctor_message": "",
-    "avg_speed": 25,  # NEW: default avg traffic speed (km/h)
+    "avg_speed": 25,  # default avg traffic speed (km/h)
 }
 for k,v in defaults.items():
     if k not in st.session_state:
@@ -778,7 +854,7 @@ if st.session_state.flow_step == "chat":
                     st.session_state.doctor_message = msg or "Recommended doctors:"
                 st.session_state.chat_stage = "doctor"
 
-        # Stage: choose doctor + date + real-time slot + distance/ETA + departure tip
+        # Stage: choose doctor + date + real-time slot + distance/ETA + mini-map + departure tip
         elif st.session_state.chat_stage == "doctor":
             doctors_df = load_doctors_file()
             chat_bot(st.session_state.doctor_message or "Recommended doctors:")
@@ -787,23 +863,22 @@ if st.session_state.flow_step == "chat":
                     columns={"Doctor Name":"Doctor"}
                 )[["Doctor","Specialization","Chamber","Visiting Time"]].to_dict("records")
 
-            # NEW: speed selector (affects ETA)
+            # Speed selector (affects ETA)
             st.session_state.avg_speed = st.select_slider(
                 "Assumed average city speed (km/h) for ETA",
                 options=[15, 20, 25, 30, 35, 40, 45, 50],
                 value=st.session_state.get("avg_speed", 25)
             )
 
-            # NEW: compute & show distance/ETA inside doctor choices when hospital can be detected
+            # Precompute distance/ETA for each recommendation if possible
             hospitals_df = load_hospitals()
-            doc_labels = []
-            doc_map = []
+            doc_labels, doc_map = [], []
             for d in st.session_state.recommendations:
                 name = d["Doctor"]
                 spec = d.get("Specialization","")
                 chamber = d.get("Chamber","")
                 label = f"Dr. {name} — {spec}"
-                if hospitals_df is not None and not hospitals_df.empty and st.session_state.user_location.get("lat") is not None:
+                if not hospitals_df.empty and st.session_state.user_location.get("lat") is not None:
                     hosp = detect_hospital_for_chamber(chamber, hospitals_df)
                     if hosp:
                         dist_km, eta_min, _, _ = compute_distance_and_eta(
@@ -856,6 +931,30 @@ if st.session_state.flow_step == "chat":
                 else:
                     st.info(f"**Serial #{serial_num}**  |  Enable location to compute distance/ETA.")
 
+                # Mini map preview if coords known
+                mini_map_png = None
+                if (
+                    st.session_state.user_location.get("lat") is not None
+                    and st.session_state.user_location.get("lon") is not None
+                    and hosp_lat is not None and hosp_lon is not None
+                ):
+                    try:
+                        mini_map_png = render_static_map(
+                            st.session_state.user_location["lat"],
+                            st.session_state.user_location["lon"],
+                            hosp_lat, hosp_lon
+                        )
+                        st.image(mini_map_png, caption=f"Your location → {st.session_state.selected_hospital} (straight-line)", use_column_width=False)
+                        st.download_button(
+                            "Download mini map (PNG)",
+                            data=mini_map_png,
+                            file_name="doctigo_mini_map.png",
+                            mime="image/png"
+                        )
+                    except Exception as e:
+                        st.caption(f"Mini map unavailable: {e}")
+
+                # Departure tip
                 start_dt = _slot_start_datetime(the_day, slot)
                 if start_dt and eta_min is not None:
                     depart_at = start_dt - timedelta(minutes=eta_min)
@@ -878,11 +977,11 @@ if st.session_state.flow_step == "chat":
                         visiting_time_str=chosen.get("Visiting Time",""),
                         distance_km=dist_km,
                         eta_min=eta_min,
-                        user_loc=st.session_state.user_location,        # NEW
-                        hospital=st.session_state.selected_hospital,    # NEW
-                        hosp_lat=hosp_lat,                              # NEW
-                        hosp_lon=hosp_lon,                              # NEW
-                        avg_speed=st.session_state.avg_speed            # NEW
+                        user_loc=st.session_state.user_location,
+                        hospital=st.session_state.selected_hospital,
+                        hosp_lat=hosp_lat,
+                        hosp_lon=hosp_lon,
+                        avg_speed=st.session_state.avg_speed
                     )
                     if ok:
                         st.session_state.chosen_doctor = chosen
@@ -1049,12 +1148,11 @@ if st.session_state.flow_step == "chat":
                     f"**Features:** {', '.join(bc['features'])}"
                 )
 
-            # NEW: enrich appointment object with any missing pieces for PDF
+            # Enrich appointment object for PDF
             if ap:
                 ap.setdefault("user_lat", st.session_state.user_location.get("lat"))
                 ap.setdefault("user_lon", st.session_state.user_location.get("lon"))
                 ap.setdefault("hospital", st.session_state.selected_hospital)
-                # hosp_lat/lon may be None if not detected earlier; try again for PDF
                 if ap.get("hosp_lat") is None or ap.get("hosp_lon") is None:
                     hospitals_df = load_hospitals()
                     if st.session_state.selected_hospital and not hospitals_df.empty:
