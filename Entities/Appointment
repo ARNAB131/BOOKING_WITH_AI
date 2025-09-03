@@ -1,0 +1,132 @@
+{
+  "name": "Appointment",
+  "type": "object",
+  "properties": {
+    "patient_name": {
+      "type": "string",
+      "description": "Patient's full name"
+    },
+    "booking_type": {
+      "type": "string",
+      "enum": [
+        "normal",
+        "emergency"
+      ],
+      "description": "Type of booking"
+    },
+    "symptoms": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of symptoms"
+    },
+    "doctor_name": {
+      "type": "string",
+      "description": "Assigned doctor name"
+    },
+    "hospital_name": {
+      "type": "string",
+      "description": "Hospital name"
+    },
+    "appointment_date": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Date and time of appointment"
+    },
+    "appointment_time": {
+      "type": "string",
+      "description": "Time slot for appointment"
+    },
+    "patient_phone": {
+      "type": "string",
+      "description": "Patient contact number"
+    },
+    "patient_gender": {
+      "type": "string",
+      "enum": [
+        "male",
+        "female",
+        "other"
+      ],
+      "description": "Patient gender"
+    },
+    "patient_age": {
+      "type": "number",
+      "description": "Patient age"
+    },
+    "patient_email": {
+      "type": "string",
+      "description": "Patient email"
+    },
+    "patient_address": {
+      "type": "string",
+      "description": "Patient address"
+    },
+    "needs_bed": {
+      "type": "boolean",
+      "description": "Whether patient needs bed/cabin"
+    },
+    "bed_type": {
+      "type": "string",
+      "enum": [
+        "General Bed",
+        "General Cabin",
+        "VIP Cabin"
+      ],
+      "description": "Type of bed/cabin if needed"
+    },
+    "bed_details": {
+      "type": "string",
+      "description": "JSON string of bed features and price"
+    },
+    "estimated_travel_time": {
+      "type": "number",
+      "description": "Travel time in minutes"
+    },
+    "distance_km": {
+      "type": "number",
+      "description": "Distance to hospital in km"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "confirmed",
+        "pending",
+        "cancelled"
+      ],
+      "default": "confirmed",
+      "description": "Appointment status"
+    }
+  },
+  "required": [
+    "patient_name",
+    "booking_type"
+  ],
+  "rls": {
+    "read": {
+      "$or": [
+        {
+          "created_by": "{{user.email}}"
+        },
+        {
+          "user_condition": {
+            "role": "admin"
+          }
+        }
+      ]
+    },
+    "write": {
+      "$or": [
+        {
+          "created_by": "{{user.email}}"
+        },
+        {
+          "user_condition": {
+            "role": "admin"
+          }
+        }
+      ]
+    }
+  }
+}
