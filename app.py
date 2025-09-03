@@ -90,19 +90,14 @@ def filter_doctors_by_hospital(doctor_df: pd.DataFrame, hospital_name: str, hosp
     """
     if doctor_df.empty or not hospital_name:
         return doctor_df
-
-    # 1) Exact hospital column match
     if "Hospital" in doctor_df.columns:
         mask = doctor_df["Hospital"].astype(str).str.casefold() == hospital_name.casefold()
         exact = doctor_df[mask]
         if not exact.empty:
             return exact
-
-    # 2) Fallback: chamber text match
     hn = _normalize_text(hospital_name)
     ha = _normalize_text(hospital_address)
     address_tokens = {t for t in ha.split(" ") if len(t) >= 4}
-
     def _ok(chamber_val: str) -> bool:
         ch = _normalize_text(chamber_val)
         if not ch:
@@ -112,7 +107,6 @@ def filter_doctors_by_hospital(doctor_df: pd.DataFrame, hospital_name: str, hosp
         if address_tokens and any(tok in ch for tok in address_tokens):
             return True
         return False
-
     return doctor_df[doctor_df["Chamber"].astype(str).apply(_ok)]
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -148,7 +142,6 @@ def load_appointments_df():
         df = pd.read_csv(APPOINTMENTS_PATH)
     except Exception:
         return pd.DataFrame(columns=["Patient Name","Symptoms","Doctor","Chamber","Slot","Timestamp","Date","SlotTime","Serial","DistanceKm","ETAmin"])
-    # backfill Date/SlotTime if missing
     if "Date" not in df.columns or "SlotTime" not in df.columns:
         df["Date"] = ""
         df["SlotTime"] = ""
@@ -189,14 +182,13 @@ def get_hospital_coords(hospital_name: str, hospitals_df: pd.DataFrame):
         return None
 
 def travel_eta_minutes(distance_km: float) -> int:
-    # Rule-of-thumb requested
     if distance_km <= 5:
         return 15
     if distance_km <= 10:
         return 20
     if distance_km <= 20:
         return 30
-    return 45  # fallback for >20 km
+    return 45
 
 def compute_distance_and_eta(user_loc: dict, hospital_name: str, hospitals_df: pd.DataFrame):
     if not user_loc or user_loc.get("lat") is None or user_loc.get("lon") is None:
@@ -208,7 +200,6 @@ def compute_distance_and_eta(user_loc: dict, hospital_name: str, hospitals_df: p
     return d, travel_eta_minutes(d)
 
 def compute_serial(slot_time: str, visiting_time_str: str) -> int:
-    """Serial = position of slot_time in the day's generated slots order."""
     try:
         all_slots = generate_slots(visiting_time_str)
     except Exception:
@@ -216,21 +207,13 @@ def compute_serial(slot_time: str, visiting_time_str: str) -> int:
     try:
         return all_slots.index(slot_time) + 1
     except ValueError:
-        # if slot_time isn't in the known list, fallback to 1
         return 1
 
 def save_appointment_row(patient_name, symptoms, doctor, chamber, slot_full, visiting_time_str, distance_km=None, eta_min=None):
-    """
-    Persist appointment ONLY if the (doctor, date, slot_time) is still free.
-    Returns (ok: bool, msg: str, serial: int | None)
-    """
     ensure_appointments_file()
     slot_time, date_str = parse_slot(slot_full)
-    # guard
     if not doctor or not slot_time or not date_str:
         return False, "Invalid slot or doctor.", None
-
-    # uniqueness check
     df = load_appointments_df()
     dup = df[(df["Doctor"].astype(str) == str(doctor)) & (df["Date"] == date_str) & (df["SlotTime"] == slot_time)]
     if not dup.empty:
@@ -250,17 +233,14 @@ def save_appointment_row(patient_name, symptoms, doctor, chamber, slot_full, vis
         "DistanceKm": round(distance_km, 2) if isinstance(distance_km, (int, float)) else "",
         "ETAmin": int(eta_min) if isinstance(eta_min, (int, float)) else "",
     }
-    # append
     with open(APPOINTMENTS_PATH, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(new_row.keys()))
-        # write header only if file is empty
         if os.stat(APPOINTMENTS_PATH).st_size == 0:
             writer.writeheader()
         writer.writerow(new_row)
-
     return True, "✅ Appointment booked and saved.", serial
 
-# --- Original appointment PDF (kept, now unicode-safe) ---
+# --- PDF helpers --------------------------------------------------------------------
 def generate_pdf_receipt(patient_name, doctor, chamber, slot, symptoms):
     pdf = FPDF()
     pdf.add_page()
@@ -301,14 +281,9 @@ def generate_pdf_receipt(patient_name, doctor, chamber, slot, symptoms):
     pdf_bytes = pdf.output(dest="S").encode("latin-1")
     return io.BytesIO(pdf_bytes)
 
-# --- NEW: combined PDF for appointment + bed/cabin (unicode-safe) ---
 def generate_full_pdf(hospital_name, patient, appointment, bed_choice):
     """
-    hospital_name: str
-    patient: dict -> name, attendant_name, attendant_phone, patient_phone, patient_age,
-                     patient_email, patient_address, checkin_date, checkout_mode, checkout_date
-    appointment: dict or None -> doctor, chamber, slot, symptoms, serial, distance_km, eta_min
-    bed_choice: dict or None -> tier, unit_id, price, features(list)
+    Combined PDF for appointment + bed/cabin.
     """
     pdf = FPDF()
     pdf.add_page()
@@ -329,17 +304,13 @@ def generate_full_pdf(hospital_name, patient, appointment, bed_choice):
     pdf.cell(0, 8, pdfsafe("Patient Details"), ln=True)
     pdf.set_font("Arial", "", 11)
 
-    checkout_str = "To be decided (post-discharge)" if patient.get("checkout_mode") == "unknown" else patient.get("checkout_date", "")
     details = f"""
 Patient Name: {patient.get('name','')}
-Attendant Name: {patient.get('attendant_name','')}
-Attendant Phone: {patient.get('attendant_phone','')}
-Patient Phone: {patient.get('patient_phone','')}
-Patient Age: {patient.get('patient_age','')}
-Patient Email: {patient.get('patient_email','')}
-Patient Address: {patient.get('patient_address','')}
-Check-in: {patient.get('checkin_date','')}
-Check-out: {checkout_str}
+Phone: {patient.get('phone','')}
+Gender: {patient.get('gender','')}
+Age: {patient.get('age','')}
+Email: {patient.get('email','')}
+Address: {patient.get('address','')}
 Issued On: {datetime.now().strftime('%d %B %Y, %I:%M %p')}
 """.strip()
     pdf.multi_cell(0, 7, pdfsafe(details))
@@ -371,6 +342,8 @@ Symptoms: {appointment.get('symptoms','')}
         features_text = ", ".join(bed_choice.get('features', []))
         bed_text = f"""
 Type: {bed_choice.get('tier','')}
+Check-in Date: {bed_choice.get('checkin_date','')}
+Check-out Date: {bed_choice.get('checkout_date','') or 'To be decided'}
 Unit ID: {bed_choice.get('unit_id','Any')}
 Price per night: Rs {bed_choice.get('price','')}
 Features: {features_text}
@@ -459,8 +432,26 @@ def reset_inventory_for_date(hospital: str, tier: str, day: date):
     df.loc[mask, "Status"] = "available"
     df.to_csv(INVENTORY_PATH, index=False)
 
+# ---------- Availability across a date range ----------
+def units_available_for_range(hospital: str, tier: str, start_day: date, end_day: date) -> list[str]:
+    """Return units that are available for ALL days in [start_day, end_day]."""
+    ensure_inventory()
+    if end_day < start_day:
+        start_day, end_day = end_day, start_day
+    avail_sets = []
+    cur = start_day
+    while cur <= end_day:
+        _ensure_rows_for(hospital, tier, cur)
+        inv = get_inventory(hospital, tier, cur)
+        avail = set(inv[inv["Status"] != "booked"]["UnitID"].astype(str).tolist())
+        avail_sets.append(avail)
+        cur += timedelta(days=1)
+    if not avail_sets:
+        return []
+    return sorted(set.intersection(*avail_sets)) if len(avail_sets) > 1 else sorted(avail_sets[0])
+
 # ------------------------------------------------------------------------------------
-# --- IDEA 5: Waitlist helpers (CSV-backed) ------------------------------------------
+# Waitlist helpers (CSV-backed)
 # ------------------------------------------------------------------------------------
 def ensure_waitlist():
     if not os.path.exists(WAITLIST_PATH):
@@ -496,17 +487,11 @@ def add_to_waitlist(hospital: str, tier: str, day: date, patient: str = "", phon
     save_waitlist(df)
 
 def auto_match_waitlist():
-    """
-    Try to fulfill each waiting request by assigning the first available unit for that date/tier/hospital.
-    Returns a tuple (#assigned, list of (idx, assigned_unit)).
-    """
     df = load_waitlist()
     assigned = 0
     changes = []
-
     if df.empty:
         return assigned, changes
-
     for idx, row in df[df["Status"] == "waiting"].sort_values("Timestamp").iterrows():
         hosp = str(row["Hospital"])
         tier = str(row["Tier"])
@@ -514,55 +499,103 @@ def auto_match_waitlist():
             day = datetime.strptime(str(row["Date"]), "%Y-%m-%d").date()
         except Exception:
             continue
-
         inv = get_inventory(hosp, tier, day)
         avail = inv[inv["Status"] != "booked"]["UnitID"].astype(str).tolist()
         if not avail:
             continue
-
         unit_id = sorted(avail, key=lambda x: (len(x), x))[0]
         mark_booked(hosp, tier, unit_id, day)
-
         df.at[idx, "Status"] = "assigned"
         df.at[idx, "AssignedUnit"] = unit_id
         assigned += 1
         changes.append((idx, unit_id))
-
     if assigned > 0:
         save_waitlist(df)
-
     return assigned, changes
+
+# ------------------------------------------------------------------------------------
+# Realtime slot helpers
+# ------------------------------------------------------------------------------------
+def _extract_slot_start_time_str(slot_label: str) -> str | None:
+    if not slot_label:
+        return None
+    m = re.search(r'(\d{1,2}:\d{2}\s*[APap][Mm])', slot_label)
+    if m:
+        return m.group(1).upper().replace(" ", "")
+    m = re.search(r'\b(\d{1,2}:\d{2})\b', slot_label)
+    if m:
+        return m.group(1)
+    return None
+
+def _slot_start_datetime(the_day: date, slot_label: str) -> datetime | None:
+    s = _extract_slot_start_time_str(slot_label)
+    if not s:
+        return None
+    try:
+        if s.lower().endswith(("am", "pm")) or ("AM" in s or "PM" in s):
+            t = datetime.strptime(s.replace("AM"," AM").replace("PM"," PM"), "%I:%M %p").time()
+        else:
+            t = datetime.strptime(s, "%H:%M").time()
+        return datetime.combine(the_day, t)
+    except Exception:
+        return None
+
+def filter_future_slots_for_date(visiting_time_str: str, the_day: date, doctor_name: str) -> list[str]:
+    all_slots = generate_slots(visiting_time_str)
+    already = booked_slot_times_for(doctor_name, the_day)
+    remaining = [s for s in all_slots if s not in already]
+    if the_day == date.today():
+        now_dt = datetime.now()
+        out = []
+        for s in remaining:
+            sd = _slot_start_datetime(the_day, s)
+            if not sd or sd > now_dt:
+                out.append(s)
+        return out
+    return remaining
+
+def fmt_countdown(seconds: int) -> str:
+    if seconds < 0:
+        seconds = 0
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}hrs {m:02d}min {s:02d}sec"
 
 # ------------------------------------------------------------------------------------
 # Session state
 # ------------------------------------------------------------------------------------
 if "flow_step" not in st.session_state:
-    st.session_state.flow_step = "home"  # home -> emergency -> hospital -> doctors -> beds -> details -> summary
-for key, default in [
-    ("selected_hospital", None),
-    ("appointment", None),
-    ("bed_choice", None),
-    ("patient_details", None),
-    ("user_location", {"lat": None, "lon": None}),
-    ("recommendations", []),
-    ("doctor_message", ""),
-    ("booked", False),
-    ("booked_doctor", ""),
-    ("slot", ""),
-    ("symptoms_used", []),
-    ("seat_selected", ""),
-    ("beds_avail_day", date.today()),
-    ("selected_beds_day", None),
-]:
-    if key not in st.session_state:
-        st.session_state[key] = default
+    st.session_state.flow_step = "home"  # home -> chat -> summary etc.
+
+defaults = {
+    "mode": None,  # "normal" or "emergency"
+    "chat_stage": None,  # "greet","symptoms","doctor","slot","bed_ask","bed_select","details","card"
+    "user_name": "",
+    "user_location": {"lat": None, "lon": None},
+    "symptoms_selected": [],
+    "symptoms_typed": "",
+    "recommendations": [],
+    "chosen_doctor": None,
+    "chosen_date": None,
+    "chosen_slot": "",
+    "appointment": None,
+    "selected_hospital": None,
+    "need_bed": None,
+    "bed_choice": None,  # {'tier','unit_id','price','features','checkin_date','checkout_date'}
+    "details_step": 0,
+    "patient_details": {"name":"", "phone":"", "gender":"", "age":"", "email":"", "address":""},
+    "doctor_message": "",
+}
+for k,v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # ------------------------------------------------------------------------------------
-# Bulk Appointment Upload (now respects slot-uniqueness)
+# Bulk Appointment Upload (kept)
 # ------------------------------------------------------------------------------------
 st.markdown("##  Bulk Appointment Upload")
 uploaded_file = st.file_uploader("Upload patient list (CSV or PDF)", type=["csv", "pdf"])
-
 if uploaded_file:
     try:
         if uploaded_file.name.endswith(".csv"):
@@ -587,7 +620,6 @@ if uploaded_file:
         if not df_bulk.empty:
             st.success(f"✅ Loaded {len(df_bulk)} patients. Starting auto booking...")
             try:
-                doctors_df = load_doctors_file()
                 for _, row in df_bulk.iterrows():
                     name = row.get("Patient Name","")
                     symptoms_list = [s.strip() for s in str(row.get("Symptoms","")).split(',') if s.strip()]
@@ -599,23 +631,15 @@ if uploaded_file:
                     chamber_val = selected.get('Chamber', '')
                     visiting_time = selected.get('Visiting Time', '')
                     today_date = datetime.today().date()
-
-                    # compute available slot for today
-                    all_slots = selected.get('Slots') or generate_slots(visiting_time)
-                    booked = booked_slot_times_for(doctor_name, today_date)
-                    avail = [s for s in all_slots if s not in booked]
+                    avail = filter_future_slots_for_date(visiting_time, today_date, doctor_name)
                     if not avail:
-                        # skip if nothing free today (simple policy)
                         continue
                     slot_time = avail[0]
                     full_slot = f"{slot_time} on {today_date.strftime('%d %B %Y')}"
-
-                    # Distance/ETA optional (needs hospital + user location)
                     hospitals_df = load_hospitals()
                     hosp_name = detect_hospital_for_chamber(chamber_val, hospitals_df) or st.session_state.get("selected_hospital")
                     dist_km, eta_min = compute_distance_and_eta(st.session_state.get("user_location"), hosp_name, hospitals_df)
-
-                    ok, msg, serial = save_appointment_row(
+                    save_appointment_row(
                         patient_name=name,
                         symptoms='; '.join(symptoms_list),
                         doctor=doctor_name,
@@ -632,28 +656,31 @@ if uploaded_file:
         st.error(f"Error processing bulk upload: {e}")
 
 # ------------------------------------------------------------------------------------
-# HOME
+# HOME — two buttons
 # ------------------------------------------------------------------------------------
 st.title("🤖 Doctigo – AI Doctor & Bed/Cabin Booking")
 col1, col2 = st.columns([1, 1])
 with col1:
-    if st.button("🔍 Normal Booking"):
-        st.session_state.flow_step = "doctors"
+    if st.button("🔎 Normal Booking"):
+        st.session_state.flow_step = "chat"
+        st.session_state.mode = "normal"
+        st.session_state.chat_stage = "greet"
 with col2:
-    if st.button("🚨 Emergency"):
-        st.session_state.flow_step = "emergency"
+    if st.button("🚨 Emergency Booking"):
+        st.session_state.flow_step = "chat"
+        st.session_state.mode = "emergency"
+        st.session_state.chat_stage = "greet"
 
 # ------------------------------------------------------------------------------------
-# EMERGENCY → Nearest Hospitals + quick actions
+# CHAT FLOW
 # ------------------------------------------------------------------------------------
-if st.session_state.flow_step == "emergency":
-    st.subheader("🚑 Nearest Hospitals")
-    st.caption("Tap **Detect My Location** to rank nearby hospitals by distance.")
+def chat_bot(msg: str):
+    st.markdown(f"🕷️ **Doc:** {msg}")
 
-    # Inputs for location (populated by JS)
-    lat_val = st.text_input("Latitude", value=st.session_state.user_location["lat"] or "", key="lat_input")
-    lon_val = st.text_input("Longitude", value=st.session_state.user_location["lon"] or "", key="lon_input")
+def chat_user(msg: str):
+    st.markdown(f"👤 **You:** {msg}")
 
+def geo_widget():
     components.html("""
         <button onclick="getLoc()" style="padding:8px 14px;">📍 Detect My Location</button>
         <p id="locout" style="margin-top:8px;"></p>
@@ -684,551 +711,333 @@ if st.session_state.flow_step == "emergency":
         </script>
     """, height=120)
 
-    hospitals_df = load_hospitals()
+if st.session_state.flow_step == "chat":
+    st.markdown("### 💬 Chat with Spider Doc")
+    box = st.container(border=True)
 
-    # Store to session if we have lat/lon
-    try:
-        st.session_state.user_location["lat"] = float(lat_val) if lat_val else None
-        st.session_state.user_location["lon"] = float(lon_val) if lon_val else None
-    except:
-        pass
+    with box:
+        # Stage: greet / ask name
+        if st.session_state.chat_stage == "greet":
+            chat_bot("Hello! I am **Doc**, your friendly neighborhood **Spider Doc** 🕷️🩺. What's your name?")
+            name = st.text_input("Your name", key="chat_name_input")
+            # also allow quick geolocation up front
+            st.text_input("Latitude", value=st.session_state.user_location["lat"] or "", key="lat_input")
+            st.text_input("Longitude", value=st.session_state.user_location["lon"] or "", key="lon_input")
+            geo_widget()
+            if st.button("Submit Name"):
+                st.session_state.user_name = (name or "").strip()
+                try:
+                    st.session_state.user_location["lat"] = float(st.session_state.get("lat_input") or "") if st.session_state.get("lat_input") else None
+                    st.session_state.user_location["lon"] = float(st.session_state.get("lon_input") or "") if st.session_state.get("lon_input") else None
+                except:
+                    pass
+                if st.session_state.user_name:
+                    chat_user(st.session_state.user_name)
+                    choice = "normal booking" if st.session_state.mode == "normal" else "emergency booking"
+                    chat_bot(f"Hello **{st.session_state.user_name}** — so you opted for **{choice}**.")
+                    st.session_state.chat_stage = "symptoms"
+                else:
+                    st.warning("Please enter your name to continue.")
 
-    if not hospitals_df.empty and st.session_state.user_location["lat"] and st.session_state.user_location["lon"]:
-        lat0 = st.session_state.user_location["lat"]
-        lon0 = st.session_state.user_location["lon"]
+        # Stage: symptoms prompt
+        elif st.session_state.chat_stage == "symptoms":
+            if st.session_state.mode == "normal":
+                chat_bot("Enter your symptoms **manually** or **select** from the drop-down. If no symptoms, type **Next**.")
+            else:
+                chat_bot("Woooo it's an **EMERGENCY**! Don't worry — I'm here with you. Enter the patient's symptoms **manually** or **select** from the drop-down. If you just want to book a doctor of your preference, type **Next**.")
+            symptom_options = list(symptom_specialization_map.keys())
+            st.session_state.symptoms_selected = st.multiselect("Select symptoms", options=symptom_options, default=st.session_state.symptoms_selected)
+            st.session_state.symptoms_typed = st.text_input("Type symptoms (comma-separated)", value=st.session_state.symptoms_typed)
+            nxt = st.text_input("Type 'Next' to skip symptoms (optional)", key="sym_next")
+            proceed = st.button("Continue ➜")
+            if proceed:
+                typed = [s.strip() for s in st.session_state.symptoms_typed.split(",") if s.strip()]
+                all_syms = sorted(list(set(st.session_state.symptoms_selected + typed)))
+                st.session_state.symptoms_selected = all_syms
+                if all_syms:
+                    chat_user(", ".join(all_syms))
+                elif (nxt or "").strip().casefold() == "next":
+                    chat_user("Next")
+                else:
+                    st.warning("Please add symptoms or type Next.")
+                    st.stop()
 
-        hospitals_df["Distance_km"] = hospitals_df.apply(
-            lambda r: haversine_km(lat0, lon0, float(r["Latitude"]), float(r["Longitude"])), axis=1
-        )
-        hospitals_df = hospitals_df.sort_values("Distance_km").reset_index(drop=True)
+                doctors_df = load_doctors_file()
+                if (nxt or "").strip().casefold() == "next" and not all_syms:
+                    chat_bot("Select a doctor of your preference:")
+                    st.session_state.recommendations = doctors_df.rename(
+                        columns={"Doctor Name":"Doctor"}
+                    )[["Doctor","Specialization","Chamber","Visiting Time"]].to_dict("records")
+                    st.session_state.doctor_message = "Here are available doctors:"
+                else:
+                    msg, recs = recommend_doctors(st.session_state.symptoms_selected)
+                    st.session_state.recommendations = recs or []
+                    st.session_state.doctor_message = msg or "Recommended doctors:"
+                st.session_state.chat_stage = "doctor"
 
-        st.markdown("### 🏥 Nearby options")
-        for i, row in hospitals_df.head(5).iterrows():
-            label = "Most Nearest" if i == 0 else ("Next Nearest" if i == 1 else f"Option {i+1}")
-            st.markdown(f"**{label}: {row['Hospital']}**  \n{row['Address']}  \nDistance: {row['Distance_km']:.2f} km")
-            if st.button(f"Select {row['Hospital']}", key=f"pick_hosp_{i}"):
-                st.session_state.selected_hospital = row['Hospital']
-                st.session_state.flow_step = "hospital"
+        # Stage: choose doctor + date + real-time slot + distance/ETA + departure tip
+        elif st.session_state.chat_stage == "doctor":
+            doctors_df = load_doctors_file()
+            chat_bot(st.session_state.doctor_message or "Recommended doctors:")
+            if not st.session_state.recommendations:
+                st.session_state.recommendations = doctors_df.rename(
+                    columns={"Doctor Name":"Doctor"}
+                )[["Doctor","Specialization","Chamber","Visiting Time"]].to_dict("records")
 
-        # Quick actions
-        try:
-            nearest = hospitals_df.iloc[0]
-            dest_lat = float(nearest["Latitude"])
-            dest_lon = float(nearest["Longitude"])
-            maps_url = f"https://www.google.com/maps/dir/?api=1&origin={lat0},{lon0}&destination={dest_lat},{dest_lon}"
-            share_my_loc = f"https://maps.google.com/?q={lat0},{lon0}"
-            st.markdown("---")
-            st.markdown("### 🚀 Quick Actions")
-            st.markdown(f"- 🧭 **Navigation:** [Open Google Maps to {nearest['Hospital']}]({maps_url})")
-            st.markdown(f"- 📍 **Share my current location:** {share_my_loc}")
+            doc_names = [f"Dr. {d['Doctor']} — {d.get('Specialization','')}" for d in st.session_state.recommendations]
+            sel = st.selectbox("Choose a doctor", options=doc_names)
+            idx = doc_names.index(sel) if sel in doc_names else 0
+            chosen = st.session_state.recommendations[idx]
+            st.write(f"**Chamber:** {chosen.get('Chamber','')}")
+            st.write(f"**Visiting Time:** {chosen.get('Visiting Time','')}")
 
-            copy_html = """
-            <button id="copy" style="margin-top:6px;padding:6px 10px;border:1px solid #2a9d8f;border-radius:8px;background:#fff;color:#2a9d8f;cursor:pointer;">Copy share link</button>
-            <script>
-              const link = "__LINK__";
-              const btn = document.getElementById('copy');
-              if (btn && navigator.clipboard) {
-                btn.addEventListener('click', function(){
-                  navigator.clipboard.writeText(link).then(function(){
-                    btn.textContent = "Copied!";
-                    setTimeout(function(){ btn.textContent = "Copy share link"; }, 1200);
-                  });
-                });
-              }
-            </script>
-            """
-            components.html(copy_html.replace("__LINK__", share_my_loc), height=50)
+            hospitals_df = load_hospitals()
+            hosp = detect_hospital_for_chamber(chosen.get("Chamber",""), hospitals_df)
+            if hosp:
+                st.session_state.selected_hospital = hosp
+                st.info(f"🏥 Hospital detected: **{hosp}**")
 
-            st.markdown("- ☎️ **Call Ambulance:** [Tap to call 108](tel:108)")
-        except Exception:
-            pass
+            the_day = st.date_input("Choose appointment date", min_value=date.today(),
+                                    value=st.session_state.chosen_date or date.today())
+            available_slots = filter_future_slots_for_date(chosen.get("Visiting Time",""), the_day, chosen["Doctor"])
+            if not available_slots:
+                st.warning("No future slots available on this date.")
+            else:
+                slot = st.selectbox("Select a slot", options=available_slots, key="chat_slot")
+                lat_val = st.text_input("Latitude", value=st.session_state.user_location["lat"] or "", key="lat_input_doc")
+                lon_val = st.text_input("Longitude", value=st.session_state.user_location["lon"] or "", key="lon_input_doc")
+                st.caption("Tip: use Detect My Location to auto-fill:")
+                geo_widget()
+                try:
+                    st.session_state.user_location["lat"] = float(lat_val) if lat_val else None
+                    st.session_state.user_location["lon"] = float(lon_val) if lon_val else None
+                except:
+                    pass
 
-    else:
-        st.info("Enter Latitude/Longitude (or use Detect My Location).")
+                dist_km, eta_min = None, None
+                if st.session_state.selected_hospital:
+                    dist_km, eta_min = compute_distance_and_eta(st.session_state.user_location, st.session_state.selected_hospital, hospitals_df)
 
-# ------------------------------------------------------------------------------------
-# HOSPITAL/DOCTORS PAGE (with slot-uniqueness + Serial/Distance/ETA)
-# ------------------------------------------------------------------------------------
-if st.session_state.flow_step in ("hospital", "doctors"):
-    doctor_df = load_doctors_file()
-    if doctor_df.empty:
-        st.stop()
-
-    hospitals_df = load_hospitals()
-    chosen_hospital = st.session_state.selected_hospital
-
-    # Hospital header (if chosen)
-    if st.session_state.flow_step == "hospital" and chosen_hospital:
-        st.subheader(f"🏥 {chosen_hospital}")
-    else:
-        st.subheader("🧑‍⚕️ Find Doctors")
-
-    # Resolve selected hospital address to improve matching
-    hospital_address = ""
-    if chosen_hospital and not hospitals_df.empty:
-        row = hospitals_df[hospitals_df["Hospital"].astype(str).str.casefold() == chosen_hospital.casefold()]
-        if not row.empty and "Address" in row.columns:
-            hospital_address = str(row.iloc[0]["Address"])
-
-    # Patient name
-    patient_name = st.text_input("Enter your name:", key="patient_name")
-
-    # Voice-to-text (kept)
-    st.markdown("### 🎙️ Voice Input for Patient Name")
-    components.html(
-        """
-        <button onclick="startDictation()" style="padding: 8px 16px; font-size: 16px; background-color: #4CAF50; color: white; border: none; border-radius: 5px;">🎤 Start Voice Input</button>
-        <p id="output" style="margin-top: 10px; font-weight: bold;"></p>
-        <script>
-        function startDictation() {
-            if (!('webkitSpeechRecognition' in window)) {
-                document.getElementById("output").innerText = "❌ Speech recognition not supported in this browser.";
-                return;
-            }
-            const recognition = new webkitSpeechRecognition();
-            recognition.lang = "en-US";
-            recognition.continuous = false;
-            recognition.interimResults = false;
-            recognition.onstart = function() {
-                document.getElementById("output").innerText = "🎙️ Listening...";
-            };
-            recognition.onresult = function(event) {
-                const transcript = event.results[0][0].transcript;
-                document.getElementById("output").innerText = "✅ You said: " + transcript;
-                const streamlitInput = window.parent.document.querySelectorAll('input[type="text"]')[0];
-                streamlitInput.value = transcript;
-                streamlitInput.dispatchEvent(new Event('input', { bubbles: true }));
-            };
-            recognition.onerror = function(event) {
-                document.getElementById("output").innerText = "❌ Error: " + event.error;
-            };
-            recognition.start();
-        }
-        </script>
-        """,
-        height=180,
-    )
-
-    # Symptoms input
-    symptom_options = list(symptom_specialization_map.keys())
-    symptoms_selected = st.multiselect("Select your symptom(s):", options=symptom_options)
-    symptoms_typed = st.text_input("Or type your symptoms (comma-separated):", key="typed_symptoms")
-    all_symptoms = list(set(symptoms_selected + [s.strip() for s in symptoms_typed.split(',') if s.strip()]))
-
-    # Filter doctors to chosen hospital (by Hospital column or Chamber text)
-    filtered_doctors = doctor_df.copy()
-    if chosen_hospital:
-        filtered_doctors = filter_doctors_by_hospital(doctor_df, chosen_hospital, hospital_address)
-        if filtered_doctors.empty:
-            st.info("No exact matches by Hospital/Chamber; showing all doctors.")
-            filtered_doctors = doctor_df
-
-    # --- Direct booking UI (NOW: pick date first -> available slots only) ---
-    st.markdown("---")
-    st.subheader("📋 Book a Doctor")
-    doctor_names = filtered_doctors['Doctor Name'].unique().tolist()
-    selected_doctor = st.selectbox("Choose a doctor (optional):", ["None"] + doctor_names)
-
-    direct_slot = ""
-    selected_date = None
-    serial_for_ui = None
-    if selected_doctor != "None":
-        selected_info = filtered_doctors[filtered_doctors['Doctor Name'] == selected_doctor].iloc[0]
-        st.markdown(f"**Specialization:** {selected_info['Specialization']}")
-        st.markdown(f"**Chamber:** {selected_info['Chamber']}")
-        visiting_time_str = selected_info['Visiting Time']
-
-        today_d = date.today()
-        selected_date = st.date_input("Choose appointment date:", min_value=today_d)
-        # compute available slots for that doctor/date
-        all_slots = generate_slots(visiting_time_str)
-        already = booked_slot_times_for(selected_doctor, selected_date)
-        available_slots = [s for s in all_slots if s not in already]
-        if not available_slots:
-            st.warning("All time frames are booked for this doctor on the selected date.")
-        else:
-            direct_slot = st.selectbox("Select a slot (available only):", available_slots, key="direct_slot")
-
-            # Show Serial vs Distance vs Time
-            if direct_slot:
-                serial_for_ui = compute_serial(direct_slot, visiting_time_str)
-                # find hospital for distance
-                hospitals_df_local = load_hospitals()
-                hospital_for_distance = chosen_hospital or detect_hospital_for_chamber(selected_info["Chamber"], hospitals_df_local)
-                dist_km, eta_min = compute_distance_and_eta(st.session_state.get("user_location"), hospital_for_distance, hospitals_df_local)
+                serial_num = compute_serial(slot, chosen.get("Visiting Time",""))
                 if dist_km is not None:
-                    st.info(f"**Serial #{serial_for_ui}**  |  **Distance:** {dist_km:.2f} km  |  **ETA:** {eta_min} min (≤5km→15m, ≤10km→20m, ≤20km→30m)")
+                    st.info(f"**Serial #{serial_num}**  |  **Distance:** {dist_km:.2f} km  |  **ETA:** ~{eta_min} min")
                 else:
-                    st.info(f"**Serial #{serial_for_ui}**  |  **ETA rule:** ≤5km→15m, ≤10km→20m, ≤20km→30m (enable location to compute distance)")
+                    st.info(f"**Serial #{serial_num}**  |  Enable location to compute distance/ETA.")
 
-            if st.button(f"📅 Book Appointment with Dr. {selected_doctor}", key="direct_book"):
-                if not direct_slot:
-                    st.error("Please select an available slot.")
-                else:
-                    # Re-check & persist to CSV (enforce uniqueness)
-                    slot_full = f"{direct_slot} on {selected_date.strftime('%d %B %Y')}"
-                    hospitals_df_local = load_hospitals()
-                    hospital_for_distance = chosen_hospital or detect_hospital_for_chamber(selected_info["Chamber"], hospitals_df_local)
-                    dist_km, eta_min = compute_distance_and_eta(st.session_state.get("user_location"), hospital_for_distance, hospitals_df_local)
-                    ok, msg, serial_num = save_appointment_row(
-                        patient_name=st.session_state.get("patient_name",""),
-                        symptoms='; '.join(all_symptoms or ["Direct Booking"]),
-                        doctor=selected_doctor,
-                        chamber=selected_info["Chamber"],
-                        slot_full=slot_full,
-                        visiting_time_str=visiting_time_str,
-                        distance_km=dist_km,
-                        eta_min=eta_min
-                    )
-                    if ok:
-                        st.session_state.appointment = {
-                            "doctor": selected_doctor,
-                            "chamber": selected_info["Chamber"],
-                            "slot": slot_full,
-                            "symptoms": "; ".join(all_symptoms or ["Direct Booking"]),
-                            "serial": serial_num,
-                            "distance_km": dist_km,
-                            "eta_min": eta_min
-                        }
-                        st.success(f"✅ Appointment booked. Serial #{serial_num}.")
-                    else:
-                        st.error(msg)
+                start_dt = _slot_start_datetime(the_day, slot)
+                if start_dt and eta_min is not None:
+                    depart_at = start_dt - timedelta(minutes=eta_min)
+                    secs = int((depart_at - datetime.now()).total_seconds())
+                    tip = "hey you should set off **now** for the chamber. you will need approx **{} min** to reach.".format(eta_min) if secs <= 0 \
+                          else f"hey you should set off in **{fmt_countdown(secs)}** for the chamber. you will need approx **{eta_min} min** to reach."
+                    chat_bot(tip)
 
-    # --- AI recommendations (respect slot uniqueness; date first) ---
-    if st.button("🔍 Find Doctors (AI)") and all_symptoms:
-        message, recommendations = recommend_doctors(all_symptoms)
-        if chosen_hospital and recommendations:
-            recs_df = pd.DataFrame(recommendations)
-            if not recs_df.empty and "Chamber" in recs_df.columns:
-                mask = recs_df["Chamber"].astype(str).str.contains(chosen_hospital, case=False, na=False)
-                recommendations = recs_df[mask].to_dict("records") if mask.any() else recommendations
-        st.session_state.recommendations = recommendations
-        st.session_state.doctor_message = message
-
-    st.subheader(st.session_state.doctor_message)
-    if st.session_state.recommendations:
-        hospitals_df_global = load_hospitals()
-        for idx, doc in enumerate(st.session_state.recommendations):
-            with st.expander(f"{idx+1}. Dr. {doc['Doctor']} - {doc['Specialization']}"):
-                st.markdown(f"**Chamber:** {doc['Chamber']}")
-                # date first
-                appt_date = st.date_input(f"Choose date for Dr. {doc['Doctor']}", key=f"date_{idx}", min_value=date.today())
-                # available slots only
-                visiting_time_str = doc.get("Visiting Time", "")
-                all_slots = doc.get("Slots") or generate_slots(visiting_time_str)
-                already = booked_slot_times_for(doc["Doctor"], appt_date)
-                avail = [s for s in all_slots if s not in already]
-                if not avail:
-                    st.warning("All time frames are booked for this doctor on the selected date.")
-                    continue
-                slot = st.selectbox(f"Select a slot for Dr. {doc['Doctor']}", options=avail, key=f"slot_{idx}")
-
-                # Serial vs distance vs time
-                serial_num = compute_serial(slot, visiting_time_str)
-                hospital_for_distance = chosen_hospital or detect_hospital_for_chamber(doc["Chamber"], hospitals_df_global)
-                dist_km, eta_min = compute_distance_and_eta(st.session_state.get("user_location"), hospital_for_distance, hospitals_df_global)
-                if dist_km is not None:
-                    st.info(f"**Serial #{serial_num}**  |  **Distance:** {dist_km:.2f} km  |  **ETA:** {eta_min} min (≤5km→15m, ≤10km→20m, ≤20km→30m)")
-                else:
-                    st.info(f"**Serial #{serial_num}**  |  **ETA rule:** ≤5km→15m, ≤10km→20m, ≤20km→30m (enable location to compute distance)")
-
-                if st.button(f"Book Appointment with Dr. {doc['Doctor']}", key=f"book_{idx}"):
-                    slot_full = f"{slot} on {appt_date.strftime('%d %B %Y')}"
+                if st.button("📅 Book This Appointment"):
+                    full_slot = f"{slot} on {the_day.strftime('%d %B %Y')}"
                     ok, msg, serial_saved = save_appointment_row(
-                        patient_name=st.session_state.get("patient_name",""),
-                        symptoms='; '.join(all_symptoms),
-                        doctor=doc["Doctor"],
-                        chamber=doc["Chamber"],
-                        slot_full=slot_full,
-                        visiting_time_str=visiting_time_str,
+                        patient_name=st.session_state.user_name,
+                        symptoms='; '.join(st.session_state.symptoms_selected) if st.session_state.symptoms_selected else (st.session_state.mode.title() + " Flow"),
+                        doctor=chosen["Doctor"],
+                        chamber=chosen.get("Chamber",""),
+                        slot_full=full_slot,
+                        visiting_time_str=chosen.get("Visiting Time",""),
                         distance_km=dist_km,
                         eta_min=eta_min
                     )
                     if ok:
+                        st.session_state.chosen_doctor = chosen
+                        st.session_state.chosen_date = the_day
+                        st.session_state.chosen_slot = slot
                         st.session_state.appointment = {
-                            "doctor": doc["Doctor"],
-                            "chamber": doc["Chamber"],
-                            "slot": slot_full,
-                            "symptoms": "; ".join(all_symptoms),
+                            "doctor": chosen["Doctor"],
+                            "chamber": chosen.get("Chamber",""),
+                            "slot": full_slot,
+                            "symptoms": '; '.join(st.session_state.symptoms_selected) if st.session_state.symptoms_selected else "",
                             "serial": serial_saved,
                             "distance_km": dist_km,
                             "eta_min": eta_min
                         }
                         st.success(f"✅ Appointment booked. Serial #{serial_saved}.")
+                        st.session_state.chat_stage = "bed_ask"
                     else:
                         st.error(msg)
 
-    # Book Beds/Cabins
-    st.markdown("---")
-    if st.button("🛏️ Book Beds/Cabins"):
-        if not st.session_state.selected_hospital and chosen_hospital:
-            st.session_state.selected_hospital = chosen_hospital
-        st.session_state.flow_step = "beds"
+        # Stage: ask bed/cabin
+        elif st.session_state.chat_stage == "bed_ask":
+            chat_bot('Do u wanna book a **Bed or Cabin**? If **Yes** type Yes, if **No** type No.')
+            yn = st.text_input("Type Yes or No", key="bed_yesno")
+            go = st.button("Submit ➜")
+            if go:
+                v = (yn or "").strip().casefold()
+                if v not in ("yes","no"):
+                    st.warning("Please type Yes or No.")
+                else:
+                    st.session_state.need_bed = (v == "yes")
+                    chat_user("Yes" if st.session_state.need_bed else "No")
+                    st.session_state.chat_stage = "bed_select" if st.session_state.need_bed else "details"
 
-# ------------------------------------------------------------------------------------
-# BEDS/CABINS — Checkbox grid (no typing)
-# ------------------------------------------------------------------------------------
-if st.session_state.flow_step == "beds":
-    hospital_name_for_beds = st.session_state.selected_hospital or "Doctigo Partner Hospital"
-    st.subheader(f"🛏️ Beds & Cabins – {hospital_name_for_beds}")
-    st.caption("Pick a date, choose a type, then tick **one** box to select your unit. (▭ Sold = unavailable)")
+        # Stage: bed/cabin selection (multi-night support, same hospital as doctor)
+        elif st.session_state.chat_stage == "bed_select":
+            hospital_name_for_beds = st.session_state.selected_hospital or "Doctigo Partner Hospital"
+            chat_bot(f"Great. Let's pick your **Bed/Cabin** at **{hospital_name_for_beds}**.")
+            checkin = st.date_input("Choose check-in date", value=st.session_state.chosen_date or date.today(), key="bed_checkin")
+            unknown = st.checkbox("I don't know the check-out date yet", value=False, key="bed_unknown")
+            checkout = None
+            if not unknown:
+                checkout = st.date_input("Choose check-out date", value=checkin, min_value=checkin, key="bed_checkout")
 
-    beds_day = st.date_input(
-        "Availability date (usually check-in):",
-        value=st.session_state.get("beds_avail_day", date.today()),
-        key="beds_avail_day"
-    )
-    day_str = beds_day.strftime("%Y-%m-%d")
+            tiers = [
+                {"tier": "General Bed",   "price": 100,  "features": ["1 bed","1 chair","bed table"]},
+                {"tier": "General Cabin", "price": 1000, "features": ["2 beds","attached washroom","bed table","chair","food x3 times"]},
+                {"tier": "VIP Cabin",     "price": 4000, "features": ["premium bed x2","sofa","Air Conditioning","attached washroom","TV","fridge","bed table x2","coffee table","2 chairs"]},
+            ]
+            tier_names = [t["tier"] for t in tiers]
+            pick_tier = st.selectbox("Select type", options=tier_names)
+            tier_obj = next(t for t in tiers if t["tier"] == pick_tier)
 
-    tiers = [
-        {"tier": "General Bed",   "price": 100,  "features": ["1 bed","1 chair","bed table"], "ids": [f"G-{i}" for i in range(1,41)], "cols": 10},
-        {"tier": "General Cabin", "price": 1000, "features": ["2 beds","attached washroom","bed table","chair","food x3 times"], "ids": [f"C-{i}" for i in range(1,21)], "cols": 5},
-        {"tier": "VIP Cabin",     "price": 4000, "features": ["premium bed x2","sofa","Air Conditioning","attached washroom","TV","fridge","bed table x2","coffee table","2 chairs"], "ids": [f"V-{i}" for i in range(1,11)], "cols": 5},
-    ]
-    tier_names = [t["tier"] for t in tiers]
-    pick_tier = st.radio("Select type", options=tier_names)
-    tier_obj = next(t for t in tiers if t["tier"] == pick_tier)
+            # Compute availability across the full range
+            start_day = checkin
+            end_day = checkout if checkout else checkin
+            avail_units = units_available_for_range(hospital_name_for_beds, tier_obj["tier"], start_day, end_day)
 
-    inv = get_inventory(hospital_name_for_beds, tier_obj["tier"], beds_day)
-    sold = set(inv[inv["Status"] == "booked"]["UnitID"].astype(str).tolist())
+            if not avail_units:
+                st.warning("All units are sold out for the selected stay. You may try a different type or dates, or continue without bed.")
+            unit_id = st.selectbox("Select a unit", options=(avail_units or ["None"]))
+            st.caption("After selection, type **Next** below.")
+            nxt = st.text_input("Type Next to continue", key="bed_next")
 
-    with st.expander(f"ℹ️ What is included in {pick_tier}?"):
-        st.markdown(f"**₹{tier_obj['price']} per night**")
-        st.markdown("- " + "\n- ".join(tier_obj["features"]))
+            if st.button("Save Bed/Cabin ➜"):
+                if avail_units and unit_id not in avail_units:
+                    st.warning("Please select an available unit.")
+                else:
+                    if avail_units:
+                        st.session_state.bed_choice = {
+                            "tier": tier_obj["tier"],
+                            "unit_id": unit_id,
+                            "price": tier_obj["price"],
+                            "features": tier_obj["features"],
+                            "checkin_date": checkin.strftime("%d %B %Y"),
+                            "checkout_date": checkout.strftime("%d %B %Y") if checkout else "",
+                        }
+                        st.success(
+                            f"Selected {pick_tier} • Unit {unit_id} "
+                            f"for {checkin.strftime('%d %b %Y')}"
+                            + (f" → {checkout.strftime('%d %b %Y')}" if checkout else "")
+                        )
+                    else:
+                        st.session_state.bed_choice = None
 
-    # Checkbox grid
-    ids = tier_obj["ids"]
-    cols = tier_obj["cols"]
+            if (st.session_state.get("bed_next") or "").strip().casefold() == "next":
+                st.session_state.chat_stage = "details"
 
-    if st.session_state.get("seat_selected") not in ids:
-        st.session_state.seat_selected = ""
+        # Stage: details one-by-one
+        elif st.session_state.chat_stage == "details":
+            steps = [
+                ("name", "Please Enter Patient's Name"),
+                ("phone", "Please Enter Phone Number"),
+                ("gender", "Please Enter Gender"),
+                ("age", "Please Enter Age"),
+                ("email", "Please Enter Email address"),
+                ("address", "Please Enter Address"),
+            ]
+            field, prompt = steps[st.session_state.details_step]
+            chat_bot(prompt)
+            if field == "age":
+                val = st.number_input("Age", min_value=0, max_value=120, value=int(st.session_state.patient_details["age"] or 30), step=1, key="detail_age")
+                clicked = st.button("Save ➜")
+                if clicked:
+                    st.session_state.patient_details["age"] = int(val)
+                    st.session_state.details_step += 1
+            elif field == "gender":
+                val = st.selectbox("Gender", options=["Male","Female","Other"], index=0 if not st.session_state.patient_details["gender"] else ["Male","Female","Other"].index(st.session_state.patient_details["gender"]))
+                clicked = st.button("Save ➜")
+                if clicked:
+                    st.session_state.patient_details["gender"] = val
+                    st.session_state.details_step += 1
+            else:
+                key_map = {"name":"detail_name","phone":"detail_phone","email":"detail_email","address":"detail_address"}
+                val = st.text_input("Type here", value=st.session_state.patient_details[field], key=key_map.get(field,f"detail_{field}"))
+                clicked = st.button("Save ➜")
+                if clicked:
+                    st.session_state.patient_details[field] = val.strip()
+                    st.session_state.details_step += 1
 
-    key_prefix = f"unit_{pick_tier}_{day_str}_"
+            if st.session_state.details_step >= len(steps):
+                st.session_state.chat_stage = "card"
 
-    def _select_unit(sel_uid, id_list, prefix):
-        st.session_state.seat_selected = sel_uid
-        for u in id_list:
-            st.session_state[f"{prefix}{u}"] = (u == sel_uid)
+        # Stage: appointment card + download, and reserve bed (multi-night)
+        elif st.session_state.chat_stage == "card":
+            ap = st.session_state.appointment or {}
+            bc = st.session_state.bed_choice
+            pdets = st.session_state.patient_details
 
-    total = len(ids)
-    rows = math.ceil(total / cols)
-    for r in range(rows):
-        row_ids = ids[r*cols:(r+1)*cols]
-        row_cols = st.columns(len(row_ids))
-        for c, uid in enumerate(row_ids):
-            disabled = uid in sold
-            label = f"{uid}" + (" ▭" if disabled else "")
-            cb_key = f"{key_prefix}{uid}"
-            row_cols[c].checkbox(
-                label,
-                key=cb_key,
-                value=(st.session_state.get("seat_selected") == uid and not disabled),
-                disabled=disabled,
-                on_change=_select_unit,
-                args=(uid, ids, key_prefix),
-                help="Tick to select this unit" if not disabled else "Already booked"
+            chat_bot("Here is your **appointment card** with all details:")
+            st.markdown("#### 🏥 Appointment Summary")
+            if ap:
+                extra = ""
+                if ap.get("serial"):
+                    extra += f"  \n**Serial #:** {ap['serial']}"
+                if ap.get("distance_km") is not None and ap.get("eta_min") is not None:
+                    extra += f"  \n**Distance/ETA:** {ap['distance_km']:.2f} km / {ap['eta_min']} min"
+                st.markdown(f"**Doctor:** Dr. {ap.get('doctor','')}  \n**Chamber:** {ap.get('chamber','')}  \n**Slot:** {ap.get('slot','')}{extra}")
+            else:
+                st.info("No appointment found.")
+
+            st.markdown("#### 👤 Patient")
+            st.markdown(
+                f"**Name:** {pdets.get('name','')}  \n"
+                f"**Phone:** {pdets.get('phone','')}  \n"
+                f"**Gender:** {pdets.get('gender','')}  \n"
+                f"**Age:** {pdets.get('age','')}  \n"
+                f"**Email:** {pdets.get('email','')}  \n"
+                f"**Address:** {pdets.get('address','')}"
             )
 
-    available_units = [uid for uid in ids if uid not in sold]
+            if bc:
+                st.markdown("#### 🛏️ Bed/Cabin")
+                st.markdown(
+                    f"**Type:** {bc['tier']} (₹{bc['price']}/night)  \n"
+                    f"**Unit ID:** {bc.get('unit_id','Any')}  \n"
+                    f"**Check-in:** {bc.get('checkin_date','')}  \n"
+                    f"**Check-out:** {bc.get('checkout_date','') or 'To be decided'}  \n"
+                    f"**Features:** {', '.join(bc['features'])}"
+                )
 
-    st.markdown("#### Your selection")
-    selected_unit = st.session_state.get("seat_selected", "")
-    if selected_unit:
-        st.success(f"Selected: **{selected_unit}** for **{beds_day.strftime('%d %b %Y')}**")
-    else:
-        st.info("No unit selected yet. Tick any available box above.")
-
-    if st.button("Next ➜", disabled=not bool(selected_unit)):
-        st.session_state.bed_choice = {
-            "tier": tier_obj["tier"],
-            "unit_id": selected_unit,
-            "price": tier_obj["price"],
-            "features": tier_obj["features"],
-        }
-        st.session_state.selected_beds_day = beds_day
-        st.session_state.flow_step = "details"
-
-    st.markdown("---")
-    st.markdown("### 🛎️ Waitlist (if fully booked)")
-    if len(available_units) == 0:
-        st.warning("All units in this type are currently **sold out** for the selected date.")
-        with st.form("waitlist_form_blocked"):
-            wl_name = st.text_input("Patient Name (optional)", value=st.session_state.get("patient_name",""))
-            wl_phone = st.text_input("Phone (optional)")
-            submitted = st.form_submit_button("🔔 Join Waitlist for this date & type")
-            if submitted:
-                add_to_waitlist(hospital_name_for_beds, pick_tier, beds_day, wl_name, wl_phone)
-                st.success("You're on the waitlist. We'll try to auto-assign a unit when one is freed.")
-    else:
-        with st.expander("Prefer to wait for a different unit? (Optional)"):
-            with st.form("waitlist_form_optional"):
-                wl_name2 = st.text_input("Patient Name (optional)", value=st.session_state.get("patient_name",""))
-                wl_phone2 = st.text_input("Phone (optional)")
-                submitted2 = st.form_submit_button("🔔 Join Waitlist anyway")
-                if submitted2:
-                    add_to_waitlist(hospital_name_for_beds, pick_tier, beds_day, wl_name2, wl_phone2)
-                    st.success("Added to waitlist. If additional units become available, we'll auto-assign in Admin > Waitlist.")
-
-# ------------------------------------------------------------------------------------
-# PATIENT DETAILS
-# ------------------------------------------------------------------------------------
-if st.session_state.flow_step == "details":
-    st.subheader("👤 Patient & Stay Details")
-    with st.form("patient_form"):
-        name = st.text_input("Patient's Name", value="")
-        attendant_name = st.text_input("Attendant's Name", value="")
-        attendant_phone = st.text_input("Attendant's Phone Number", value="")
-        patient_phone = st.text_input("Patient's Phone Number", value="")
-        patient_age = st.number_input("Patient's Age", min_value=0, max_value=120, value=30, step=1)
-        patient_email = st.text_input("Patient's Email Address", value="")
-        patient_address = st.text_area("Patient's Address", value="")
-        checkin_date = st.date_input("Date of Check-in", value=date.today())
-
-        st.markdown("**Date of Check-out**")
-        unknown = st.checkbox("Discharge date will be provided later (no fixed check-out yet)", value=True)
-        checkout_date = None
-        if not unknown:
-            checkout_date = st.date_input("Select your check-out date", min_value=checkin_date)
-
-        submitted = st.form_submit_button("Done")
-        if submitted:
-            st.session_state.patient_details = {
-                "name": name,
-                "attendant_name": attendant_name,
-                "attendant_phone": attendant_phone,
-                "patient_phone": patient_phone,
-                "patient_age": patient_age,
-                "patient_email": patient_email,
-                "patient_address": patient_address,
-                "checkin_date": checkin_date.strftime("%d %B %Y"),
-                "checkout_mode": "unknown" if unknown else "date",
-                "checkout_date": checkout_date.strftime("%d %B %Y") if checkout_date else "",
-            }
-            st.session_state.flow_step = "summary"
-
-# ------------------------------------------------------------------------------------
-# SUMMARY + COMBINED PDF
-# ------------------------------------------------------------------------------------
-if st.session_state.flow_step == "summary":
-    hospital_header = st.session_state.selected_hospital or "Doctigo Partner Hospital"
-    st.success("✅ Details captured. Your combined summary is ready.")
-
-    st.markdown("---")
-    st.markdown(f"### 🏥 {hospital_header}")
-
-    if st.session_state.appointment:
-        ap = st.session_state.appointment
-        extra = ""
-        if ap.get("serial"):
-            extra += f"  \n**Serial #:** {ap['serial']}"
-        if ap.get("distance_km") is not None and ap.get("eta_min") is not None:
-            extra += f"  \n**Distance/ETA:** {ap['distance_km']:.2f} km / {ap['eta_min']} min"
-        st.markdown(f"**Doctor:** Dr. {ap['doctor']}  \n**Chamber:** {ap['chamber']}  \n**Slot:** {ap['slot']}  \n**Symptoms:** {ap.get('symptoms','')}{extra}")
-    else:
-        st.info("No doctor appointment selected.")
-
-    if st.session_state.bed_choice:
-        bc = st.session_state.bed_choice
-        st.markdown(f"**Bed/Cabin:** {bc['tier']} (₹{bc['price']}/night)  \n**Unit ID:** {bc.get('unit_id','Any')}  \n**Features:** {', '.join(bc['features'])}")
-    else:
-        st.info("No bed/cabin selected.")
-
-    pdets = st.session_state.patient_details or {}
-    check_out_text = "To be decided" if pdets.get('checkout_mode') == 'unknown' else pdets.get('checkout_date','')
-    st.markdown(
-        f"**Patient:** {pdets.get('name','')}  \n"
-        f"**Attendant:** {pdets.get('attendant_name','')} ({pdets.get('attendant_phone','')})  \n"
-        f"**Patient Phone:** {pdets.get('patient_phone','')}  \n"
-        f"**Age:** {pdets.get('patient_age','')}  \n"
-        f"**Email:** {pdets.get('patient_email','')}  \n"
-        f"**Address:** {pdets.get('patient_address','')}  \n"
-        f"**Check-in:** {pdets.get('checkin_date','')}  \n"
-        f"**Check-out:** {check_out_text}"
-    )
-
-    pdf_buf = generate_full_pdf(
-        hospital_name=hospital_header,
-        patient=st.session_state.patient_details or {},
-        appointment=st.session_state.appointment,
-        bed_choice=st.session_state.bed_choice
-    )
-    st.download_button("⬇️ Download Combined PDF", data=pdf_buf, file_name="doctigo_booking_summary.pdf", mime="application/pdf")
-
-    # Reserve bed/cabin (per date or range)
-    if st.session_state.bed_choice and st.session_state.bed_choice.get("unit_id"):
-        start_day = datetime.strptime(st.session_state.patient_details.get("checkin_date"), "%d %B %Y").date()
-        if st.session_state.patient_details.get("checkout_mode") == "date" and st.session_state.patient_details.get("checkout_date"):
-            end_day = datetime.strptime(st.session_state.patient_details["checkout_date"], "%d %B %Y").date()
-        else:
-            end_day = start_day
-
-        if st.button("✅ Confirm & Reserve Bed/Cabin"):
-            mark_booked_range(
-                hospital=st.session_state.selected_hospital or "Doctigo Partner Hospital",
-                tier=st.session_state.bed_choice["tier"],
-                unit_id=st.session_state.bed_choice["unit_id"],
-                start_day=start_day,
-                end_day=end_day
+            pdf_buf = generate_full_pdf(
+                hospital_name=st.session_state.selected_hospital or "Doctigo Partner Hospital",
+                patient=pdets,
+                appointment=ap,
+                bed_choice=bc
             )
-            st.success("Bed/Cabin reserved. Inventory updated for the selected date range.")
+            st.download_button("⬇️ Download Appointment Card (PDF)", data=pdf_buf, file_name="doctigo_appointment_card.pdf", mime="application/pdf")
 
-    st.markdown("---")
-    colA, colB = st.columns(2)
-    with colA:
-        if st.button("🏠 Home"):
-            st.session_state.flow_step = "home"
-            st.session_state.appointment = None
-            st.session_state.bed_choice = None
-            st.session_state.patient_details = None
-            st.session_state.selected_hospital = None
-            st.session_state.seat_selected = ""
-    with colB:
-        if st.button("🔁 Book Another Bed/Cabin"):
-            st.session_state.flow_step = "beds"
+            # Reserve bed in inventory now across the full date range
+            if bc and bc.get("unit_id"):
+                start_day = datetime.strptime(bc["checkin_date"], "%d %B %Y").date() if bc.get("checkin_date") else date.today()
+                end_day = datetime.strptime(bc["checkout_date"], "%d %B %Y").date() if bc.get("checkout_date") else start_day
+                if st.button("✅ Confirm & Reserve Selected Bed/Cabin"):
+                    mark_booked_range(
+                        hospital=st.session_state.selected_hospital or "Doctigo Partner Hospital",
+                        tier=bc["tier"],
+                        unit_id=bc["unit_id"],
+                        start_day=start_day,
+                        end_day=end_day
+                    )
+                    st.success(
+                        "Bed/Cabin reserved for the selected date"
+                        + ("" if start_day == end_day else f" range ({start_day.strftime('%d %b %Y')} → {end_day.strftime('%d %b %Y')}).")
+                    )
 
-# ------------------------------------------------------------------------------------
-# ORIGINAL quick confirmation (legacy path)
-# ------------------------------------------------------------------------------------
-if st.session_state.get("booked", False):
-    st.success(f"✅ Appointment Booked with Dr. {st.session_state.booked_doctor} at {st.session_state.slot}")
+            st.markdown("---")
+            if st.button("🏠 Back to Home"):
+                for k in ["mode","chat_stage","user_name","symptoms_selected","symptoms_typed","recommendations",
+                          "chosen_doctor","chosen_date","chosen_slot","appointment","need_bed","bed_choice",
+                          "details_step","patient_details","doctor_message"]:
+                    if k in st.session_state:
+                        del st.session_state[k]
+                st.session_state.flow_step = "home"
 
-    # Save appointment (legacy) — this path may double-book; prefer the new flows above.
-    doctor_df_for_save = load_doctors_file()
-    chamber_val = ""
-    visiting_time_guess = ""
-    if not doctor_df_for_save.empty:
-        m = doctor_df_for_save[doctor_df_for_save["Doctor Name"] == st.session_state.booked_doctor]
-        if not m.empty:
-            chamber_val = m.iloc[0]["Chamber"]
-            visiting_time_guess = m.iloc[0]["Visiting Time"]
-
-    # Attempt to save via the safe helper
-    ok, msg, serial_num = save_appointment_row(
-        patient_name=st.session_state.get("patient_name", ""),
-        symptoms='; '.join(st.session_state.symptoms_used),
-        doctor=st.session_state.booked_doctor,
-        chamber=chamber_val,
-        slot_full=st.session_state.slot,
-        visiting_time_str=visiting_time_guess
-    )
-    if not ok:
-        st.warning(msg)
-
-    # CSV quick download (legacy)
-    csv_file = io.StringIO()
-    csv_file.write("Doctor,Chamber,Slot,Symptoms\n")
-    csv_file.write(f"{st.session_state.booked_doctor},{chamber_val},{st.session_state.slot},{'; '.join(st.session_state.symptoms_used)}\n")
-    st.download_button("⬇️ Download CSV", data=csv_file.getvalue(), file_name="appointment.csv", mime="text/csv")
-
-    # PDF quick download (legacy)
-    pdf_buffer = generate_pdf_receipt(
-        st.session_state.get("patient_name", ""),
-        st.session_state.booked_doctor,
-        chamber_val,
-        st.session_state.slot,
-        '; '.join(st.session_state.symptoms_used)
-    )
-    st.download_button("⬇️ Download PDF", data=pdf_buffer, file_name="appointment.pdf", mime="application/pdf")
+    st.stop()
 
 # ------------------------------------------------------------------------------------
 # Admin Dashboard + Bed Inventory Tools + Waitlist tools
@@ -1298,7 +1107,6 @@ if admin_access:
             filtered_df = filtered_df.assign(ParsedDate=parsed_dates)
             upcoming = filtered_df[filtered_df['ParsedDate'].between(today, today + timedelta(days=3), inclusive="both")]
         else:
-            # fallback for legacy rows
             filtered_df['Parsed Date'] = pd.to_datetime(filtered_df['Slot'].str.extract(r'on (.+)$')[0], errors='coerce')
             upcoming = filtered_df[filtered_df['Parsed Date'].between(today, today + timedelta(days=3))]
 
@@ -1312,17 +1120,6 @@ if admin_access:
         st.download_button("⬇️ Export All Appointments CSV", filtered_df.to_csv(index=False).encode('utf-8'),
                            "appointments_admin.csv", mime="text/csv")
 
-        st.markdown("### 📅 Calendar View")
-        if "ParsedDate" in filtered_df.columns:
-            grouped = filtered_df.dropna(subset=["ParsedDate"]).groupby(['ParsedDate', 'Doctor']).size().reset_index(name='Appointments')
-            for date_, group in grouped.groupby('ParsedDate'):
-                st.markdown(f"#### {date_.strftime('%d %B %Y')}")
-                for _, row in group.iterrows():
-                    st.write(f"👨‍⚕️ {row['Doctor']} - {row['Appointments']} appointment(s)")
-        else:
-            st.info("Calendar view available once date parsing completes.")
-
-        # ---------- Bed Inventory Tools ----------
         st.markdown("### 🧰 Bed Inventory Tools")
         hospitals_df = load_hospitals()
         h_options = hospitals_df["Hospital"].tolist() if not hospitals_df.empty else []
@@ -1334,24 +1131,20 @@ if admin_access:
             reset_inventory_for_date(sel_hosp, sel_tier, sel_day)
             st.success("Availability reset to ALL AVAILABLE for that date/tier.")
 
-        # ---------- Waitlist Admin ----------
         st.markdown("### 📬 Waitlist")
         wl_df = load_waitlist()
         if wl_df.empty:
             st.info("No waitlist entries yet.")
         else:
             st.dataframe(wl_df, use_container_width=True)
-
             if st.button("⚙️ Run Auto-Match Now"):
                 assigned_count, changes = auto_match_waitlist()
                 if assigned_count > 0:
                     st.success(f"Assigned {assigned_count} waitlist request(s): " + ", ".join([f"#{i}→{u}" for i, u in changes]))
                 else:
-                    st.info("No matches found right now (no available units for pending waitlist entries).")
-            wl_df = load_waitlist()  # refresh after potential changes
+                    st.info("No matches found right now.")
+            wl_df = load_waitlist()
             st.download_button("⬇️ Export Waitlist CSV", wl_df.to_csv(index=False).encode("utf-8"), "waitlist.csv", mime="text/csv")
-    else:
-        st.info("No appointments to show yet.")
 else:
     st.warning("🔐 Admin access required to view dashboard.")
 
