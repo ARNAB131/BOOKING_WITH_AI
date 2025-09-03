@@ -634,7 +634,7 @@ for k, v in defaults.items():
 # Header + Chat helpers (HTML bubbles with icons & timestamps)
 # ----------------------------------------------------------------------------------------------
 st.markdown('<div class="hero">♡</div>', unsafe_allow_html=True)
-st.markdown('<div class="hero-sub">Your AI-powered medical booking assistant</div>', unsafe_allow_html=True)
+st.markdown('<div class="hero-sub">Doctigo AI-powered medical booking assistant</div>', unsafe_allow_html=True)
 
 def _now_ts():
     return datetime.now().strftime("%I:%M %p").lstrip("0")
@@ -1253,3 +1253,4 @@ else:
 
 st.markdown("---")
 st.caption("Built with ❤️ by Doctigo AI Booking System")
+
