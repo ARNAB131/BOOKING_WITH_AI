@@ -1,7 +1,8 @@
 # app.py
-# Doctigo – AI Doctor & Bed/Cabin Booking (hardened)
-# ---------------------------------------------------
-# Streamlit app with robust I/O, safe fallbacks, ETA + static map, and admin tools.
+# Doctigo – AI Doctor & Bed/Cabin Booking (hardened + contact backfill)
+# ---------------------------------------------------------------------
+# Streamlit app with robust I/O, safe fallbacks, ETA + static map, admin tools,
+# and guaranteed Phone/Email persistence into CSV and PDF.
 
 import os
 import io
@@ -9,7 +10,7 @@ import re
 import csv
 import math
 import json
-import fitz  # PyMuPDF (for future PDF uploads if needed)
+import fitz  # PyMuPDF (optional, for future PDF uploads)
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -22,7 +23,7 @@ from datetime import datetime, timedelta, date
 try:
     from ai_booking import recommend_doctors, symptom_specialization_map, generate_slots  # type: ignore
 except Exception:
-    # Fallbacks: minimal behavior to keep the app working without ai_booking.py
+    # Minimal fallbacks to keep app functional without ai_booking.py
     symptom_specialization_map = {
         "fever": ["General Medicine"],
         "cough": ["General Medicine"],
@@ -36,9 +37,8 @@ except Exception:
     def recommend_doctors(symptoms):
         specs = set()
         for s in (symptoms or []):
-            specs.update(symptom_specialization_map.get(s.lower(), []))
+            specs.update(symptom_specialization_map.get(str(s).lower(), []))
         msg = "Recommended doctors based on your symptoms." if specs else "Here are available doctors:"
-        # fallback: read doctor file and filter by specialization
         df = pd.DataFrame()
         try:
             df = pd.read_csv("doctor.csv") if os.path.exists("doctor.csv") else pd.read_csv("doctors.csv")
@@ -54,7 +54,7 @@ except Exception:
         return msg, df[cols].to_dict("records")
 
     def generate_slots(visiting_time_str: str):
-        # very basic fallback: parse ranges like "11.00am-1.30pm" -> 20-minute slots
+        # Parse ranges like "11.00am-1.30pm" -> 20-min slots (fallback)
         pattern = r"(\d{1,2})[.:](\d{2})\s*([AaPp][Mm])\s*-\s*(\d{1,2})[.:](\d{2})\s*([AaPp][Mm])"
         m = re.search(pattern, str(visiting_time_str))
         if not m:
@@ -64,7 +64,7 @@ except Exception:
         start = datetime.strptime(f"{int(h1)}:{int(m1)} {ampm1.upper()}", fmt)
         end = datetime.strptime(f"{int(h2)}:{int(m2)} {ampm2.upper()}", fmt)
         if end <= start:
-            end += timedelta(hours=12)  # naive roll
+            end += timedelta(hours=12)
         cur, out = start, []
         while cur <= end:
             out.append(cur.strftime("%I:%M %p"))
@@ -131,7 +131,6 @@ def load_doctors_file():
         pass
     else:
         return pd.DataFrame()
-    # Clean NaNs
     df = df.fillna("")
     return df
 
@@ -237,7 +236,6 @@ def load_appointments_df():
         df = pd.read_csv(APPOINTMENTS_PATH)
     except Exception:
         return pd.DataFrame(columns=APPT_HEADERS)
-    # Backfill missing columns
     for c in APPT_HEADERS:
         if c not in df.columns:
             df[c] = ""
@@ -301,17 +299,44 @@ def save_appointment_row(patient_name, symptoms, doctor, chamber, slot_full, vis
         "Phone": phone or "",
         "Email": email or "",
     }
-
-    # Append safely (always preserve header)
     file_exists = os.path.exists(APPOINTMENTS_PATH) and os.stat(APPOINTMENTS_PATH).st_size > 0
     with open(APPOINTMENTS_PATH, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=APPT_HEADERS)
         if not file_exists:
             writer.writeheader()
         writer.writerow(new_row)
-    # Clear cache for immediate consistency in admin view
     load_appointments_df.clear()
     return True, "✅ Appointment booked and saved.", serial
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# NEW: Backfill function to ensure Phone/Email are saved after details stage too
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+def update_appointment_contact(patient_name: str, doctor: str, slot_full: str, phone: str, email: str):
+    """
+    Update phone/email for the most recent matching appointment (patient+doctor+slot).
+    Safe no-op if nothing matches.
+    """
+    ensure_appointments_file()
+    try:
+        df = pd.read_csv(APPOINTMENTS_PATH)
+    except Exception:
+        return
+    if df.empty:
+        return
+
+    mask = (
+        (df["Patient Name"].astype(str) == str(patient_name)) &
+        (df["Doctor"].astype(str) == str(doctor)) &
+        (df["Slot"].astype(str) == str(slot_full))
+    )
+    idxs = df[mask].index.tolist()
+    if not idxs:
+        return
+    idx = idxs[-1]  # latest match
+    df.at[idx, "Phone"] = phone or ""
+    df.at[idx, "Email"] = email or ""
+    df.to_csv(APPOINTMENTS_PATH, index=False)
+    load_appointments_df.clear()
 
 # ------------------------------------------------------------------------------
 # Static mini map (no internet)
@@ -336,13 +361,10 @@ def render_static_map(user_lat, user_lon, hosp_lat, hosp_lon):
     ax.scatter([hlon], [hlat], s=55, marker="s", label="Hospital", zorder=3)
     ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
     ax.set_title("Approx path (straight-line)")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper left", frameon=True)
+    ax.grid(True, alpha=0.3); ax.legend(loc="upper left", frameon=True)
 
     buf = BytesIO()
-    fig.tight_layout()
-    fig.savefig(buf, format="png")
-    plt.close(fig)
+    fig.tight_layout(); fig.savefig(buf, format="png"); plt.close(fig)
     buf.seek(0)
     return buf
 
@@ -358,7 +380,6 @@ def _fmt_coords(lat, lon):
         return ""
 
 def generate_full_pdf(hospital_name, patient, appointment, bed_choice):
-    # optional mini map
     mini_map_path = None
     try:
         if appointment and appointment.get("user_lat") not in (None, "") and appointment.get("user_lon") not in (None, "") \
@@ -373,11 +394,9 @@ def generate_full_pdf(hospital_name, patient, appointment, bed_choice):
     pdf = FPDF()
     pdf.add_page()
 
-    # Header
     pdf.set_font("Arial", "B", 18)
     pdf.cell(0, 10, pdfsafe(hospital_name or "Doctigo"), ln=True, align='C')
-    pdf.set_font("Arial", "B", 12)
-    pdf.ln(3)
+    pdf.set_font("Arial", "B", 12); pdf.ln(3)
     pdf.cell(0, 8, pdfsafe("Booking Summary"), ln=True, align='C')
     pdf.set_font("Arial", "", 11)
     pdf.cell(0, 5, pdfsafe("----------------------------------------"), ln=True, align='C')
@@ -437,7 +456,6 @@ Features: {features_text}"""
     pdf.ln(6); pdf.set_font("Arial", "I", 9); pdf.set_text_color(120)
     pdf.cell(0, 8, pdfsafe("This receipt is auto-generated by Doctigo AI System."), ln=True, align="C")
     pdf.set_text_color(0)
-
     pdf_bytes = pdf.output(dest="S").encode("latin-1")
     return io.BytesIO(pdf_bytes)
 
@@ -588,7 +606,6 @@ def load_waitlist() -> pd.DataFrame:
         df = pd.read_csv(WAITLIST_PATH)
     except Exception:
         df = pd.DataFrame(columns=["Timestamp","Hospital","Tier","Date","Status","Patient","Phone","AssignedUnit"])
-    # normalize
     for c in ["Timestamp","Hospital","Tier","Date","Status","Patient","Phone","AssignedUnit"]:
         if c not in df.columns:
             df[c] = ""
@@ -643,7 +660,7 @@ def auto_match_waitlist():
 # Session State Defaults
 # ------------------------------------------------------------------------------
 if "flow_step" not in st.session_state:
-    st.session_state.flow_step = "home"  # home -> chat -> summary
+    st.session_state.flow_step = "home"
 
 defaults = {
     "mode": None,  # "normal" | "emergency"
@@ -680,7 +697,6 @@ def chat_user(msg: str):
     st.markdown(f"👤 **You:** {msg}")
 
 def geo_widget(lat_key: str, lon_key: str, label="📍 Detect My Location"):
-    # Safer injection: targets fields by aria-label matching Streamlit label text.
     components.html(f"""
         <button onclick="getLoc()" style="padding:8px 14px;">{label}</button>
         <p id="locout" style="margin-top:8px;"></p>
@@ -911,6 +927,7 @@ if st.session_state.flow_step == "chat":
                         hosp_lat=hosp_lat,
                         hosp_lon=hosp_lon,
                         avg_speed=st.session_state.avg_speed,
+                        # might be empty now; will be backfilled after details
                         phone=st.session_state.patient_details.get("phone",""),
                         email=st.session_state.patient_details.get("email","")
                     )
@@ -1025,7 +1042,21 @@ if st.session_state.flow_step == "chat":
                     st.session_state.patient_details[field] = (val or "").strip()
                     st.session_state.details_step += 1
 
+            # >>> Backfill phone/email into the already-saved appointment (if any)
             if st.session_state.details_step >= len(steps):
+                ap = st.session_state.get("appointment") or {}
+                pdets = st.session_state.get("patient_details", {})
+                if ap and pdets:
+                    try:
+                        update_appointment_contact(
+                            patient_name=st.session_state.get("user_name",""),
+                            doctor=ap.get("doctor",""),
+                            slot_full=ap.get("slot",""),
+                            phone=pdets.get("phone",""),
+                            email=pdets.get("email","")
+                        )
+                    except Exception:
+                        pass
                 st.session_state.chat_stage = "card"
 
         # Final card + PDF + bed reserve
@@ -1045,6 +1076,23 @@ if st.session_state.flow_step == "chat":
                 st.markdown(f"**Doctor:** Dr. {ap.get('doctor','')}  \n**Chamber:** {ap.get('chamber','')}  \n**Slot:** {ap.get('slot','')}{extra}")
             else:
                 st.info("No appointment found.")
+
+            # --- Contact quick-fix editor (ensures UI + CSV + PDF are in sync) ---
+            with st.expander("✏️ Edit / Confirm Contact"):
+                new_phone = st.text_input("Phone", value=str(pdets.get("phone","")), key="card_phone_edit")
+                new_email = st.text_input("Email", value=str(pdets.get("email","")), key="card_email_edit")
+                if st.button("Save Contact"):
+                    st.session_state.patient_details["phone"] = new_phone.strip()
+                    st.session_state.patient_details["email"] = new_email.strip()
+                    if ap:
+                        update_appointment_contact(
+                            patient_name=st.session_state.get("user_name",""),
+                            doctor=ap.get("doctor",""),
+                            slot_full=ap.get("slot",""),
+                            phone=new_phone.strip(),
+                            email=new_email.strip()
+                        )
+                    st.success("Contact details saved. PDF will include them.")
 
             st.markdown("#### 👤 Patient")
             st.markdown(
@@ -1066,7 +1114,7 @@ if st.session_state.flow_step == "chat":
                     f"**Features:** {', '.join(bc['features'])}"
                 )
 
-            # enrich ap for PDF (ensure coords & speed)
+            # Enrich ap for PDF (ensure coords & speed)
             if ap:
                 ap.setdefault("user_lat", st.session_state.user_location.get("lat"))
                 ap.setdefault("user_lon", st.session_state.user_location.get("lon"))
@@ -1149,7 +1197,6 @@ if st.session_state.get("admin_logged_in", False):
     if os.path.exists(APPOINTMENTS_PATH):
         try:
             current_df = pd.read_csv(APPOINTMENTS_PATH)
-            # backfill headers if missing
             for c in APPT_HEADERS:
                 if c not in current_df.columns:
                     current_df[c] = ""
