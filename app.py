@@ -1298,7 +1298,7 @@ if admin_access:
             if st.button("🔧 Run Auto-Match Now"):
                 assigned_count, changes = auto_match_waitlist()
                 if assigned_count > 0:
-                    st.success(f"Assigned {assigned_count} waitlist request(s): " + ", ".join([f\"#{i}→{u}\" for i, u in changes]))
+                    st.success(f"Assigned {assigned_count} waitlist request(s): " + ", ".join([f"#{i}→{u}\" for i, u in changes]))
                 else:
                     st.info("No matches found right now.")
             wl_df = load_waitlist()
@@ -1308,3 +1308,4 @@ else:
 
 st.markdown("---")
 st.caption("Built with ❤️ by Doctigo AI Booking System")
+
